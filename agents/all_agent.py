@@ -258,15 +258,15 @@ builder.add_node("weather", weather_node)
 builder.add_node("track", track_node)
 builder.add_node("routing", routing_node)
 builder.add_node("planner", planner_node)
-builder.add_node("simulation", simulation_node)
+
 builder.add_node("master", master_node)
 
 builder.set_entry_point("weather")
 builder.add_edge("weather", "track")
 builder.add_edge("track", "routing")
 builder.add_edge("routing", "planner")
-builder.add_edge("planner", "simulation")
-builder.add_edge("simulation", "master")
+builder.add_edge("planner", "master")
+
 builder.add_edge("master", END)
 
 graph = builder.compile()
