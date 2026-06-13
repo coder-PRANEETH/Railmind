@@ -1,8 +1,8 @@
 import time
 import copy
 import random
-from models import NetworkState, StationNode, TrackSegment, TrainState, TrackStatus, WeatherCondition
-from graph import RailwayGraph
+from .models import NetworkState, StationNode, TrackSegment, TrainState, TrackStatus, WeatherCondition
+from .graph import RailwayGraph
 
 class DigitalTwin:
     def __init__(self, graph: RailwayGraph):

@@ -1,5 +1,5 @@
 import networkx as nx
-from models import TrackStatus
+from .models import TrackStatus
 
 class RailwayGraph:
     def __init__(self):

@@ -3,8 +3,106 @@ from typing import List, TypedDict
 import networkx as nx
 from langgraph.graph import END, StateGraph
 
-from digital_twin import DigitalTwin
-from track_model import demo_track_model
+
+
+import requests
+
+trains  = {
+    "T001": [
+        "CHENNAI_CHET",
+        "SECUNDERABAD",
+        "NAGPUR_JUNCT",
+        "RAIPUR_JUNCT",
+        "RANCHI",
+        "HOWRAH_JUNCT"
+    ],
+
+    "T002": [
+        "NEW_DELHI",
+        "JAIPUR_JUNCT",
+        "BHOPAL_JUNCT",
+        "NAGPUR_JUNCT"
+    ],
+
+    "T003": [
+        "MUMBAI_CENTR",
+        "SECUNDERABAD",
+        "CHENNAI_CHET",
+        "THIRUVANANTH"
+    ],
+
+    "T004": [
+        "GUWAHATI",
+        "PATNA_JUNCTI",
+        "LUCKNOW_JUNC",
+        "NEW_DELHI"
+    ],
+
+    "T005": [
+        "AHMEDABAD_JU",
+        "BHOPAL_JUNCT",
+        "RAIPUR_JUNCT",
+        "RANCHI",
+        "HOWRAH_JUNCT"
+    ],
+
+    "T006": [
+        "JAMMU_TAWI",
+        "DEHRADUN",
+        "NEW_DELHI",
+        "LUCKNOW_JUNC",
+        "PATNA_JUNCTI"
+    ],
+
+    "T007": [
+        "PUNE_JUNCTIO",
+        "SECUNDERABAD",
+        "NAGPUR_JUNCT",
+        "BHOPAL_JUNCT"
+    ],
+
+    "T008": [
+        "BENGALURU_EA",
+        "SECUNDERABAD",
+        "MUMBAI_CENTR",
+        "AHMEDABAD_JU"
+    ],
+
+    "T009": [
+        "CHANDIGARH_R",
+        "JAIPUR_JUNCT",
+        "BHOPAL_JUNCT",
+        "RAIPUR_JUNCT"
+    ],
+
+    "T010": [
+        "BHUBANESWAR",
+        "HOWRAH_JUNCT",
+        "GUWAHATI"
+    ]
+}
+
+BASE_URL = "http://127.0.0.1:8000"
+response = requests.get(f"{BASE_URL}/api/state/")
+response = response.json()
+
+
+import networkx as nx
+
+def build_graph_from_state(state):
+    graph_data = state["graph"]
+
+    G = nx.Graph()
+
+    # Add stations
+    G.add_nodes_from(graph_data["nodes"])
+
+    # Add railway connections
+    G.add_edges_from(graph_data["edges"])
+
+    return G
+
+graph = build_graph_from_state(response)
 
 
 # =========================
@@ -12,9 +110,8 @@ from track_model import demo_track_model
 # =========================
 
 class RailState(TypedDict):
-    twin: DigitalTwin
-    track_data: dict
-    weather_risk: float
+
+    weather_risk: dict
     closed_tracks: List[str]
     
     track_actions: List[str]
@@ -24,21 +121,19 @@ class RailState(TypedDict):
     best_plan: dict
 
 
+
+
 # =========================
 # WEATHER AGENT
 # =========================
 
 def weather_node(state: RailState):
-    rainfall = state["twin"].weather["rainfall"]
-    actions = []
+    for i in response["weather"]:
+        rainfall = i["rainfall"]
+        temperature = i["temperature"]
 
-    if rainfall > 80:
-        actions.append("recommend_track_closure")
-        actions.append("reduce_speed")
-    else:
-        actions.append("weather_alert")
-
-    state["weather_risk"] = min(rainfall / 100, 1)
+        weather_risk = 100 * (0.7 * (min(rainfall / 50, 1)) + 0.3 * min((temperature - 25) / 25,1))
+        state["weather_risk"][response["weather"]["track_id"]] = weather_risk
     return state
 
 
@@ -47,55 +142,63 @@ def weather_node(state: RailState):
 # =========================
 
 def track_node(state: RailState):
-    features = {
-        "track_id": state["track_data"]["track_id"],
-        "track_health": state["track_data"]["track_health"],
-        "track_age": state["track_data"]["track_age"],
-        "maintenance_days": state["track_data"]["maintenance_days"],
-        "weather_risk": state["weather_risk"],
-    }
+    for i in response["tracks"]:
+        track_id = i["track_id"]
+        track_health = i["health"]
+        weather_risk = state["weather_risk"][track_id]
 
-    track_action = demo_track_model.predict(features)
+        risk_score = 100 * (0.7 * (1 - track_health) + 0.3 * weather_risk)
 
-    state["track_actions"] = [track_action]
-    state["closed_tracks"] = []
+        if risk_score > 80:
+            state["closed_tracks"].append(track_id)
+        elif risk_score > 40:
+            state["track_actions"] = ["reduce_speed"]
+        else:
+            state["track_actions"] = ["noop"]
 
-    if track_action == "close":
-        state["closed_tracks"] = [
-            state["track_data"]["track_id"]
-        ]
-
+    
     return state
-
 
 # =========================
 # ROUTING AGENT
 # =========================
 
+def travels_directly(route, station1, station2):
+    for i in range(len(route) - 1):
+        if route[i] == station1 and route[i + 1] == station2:
+            return True
+    return False
+
 def routing_node(state: RailState):
+    G = graph.copy()
+    rerouted_trains=[]
+    for closed in state["closed_tracks"] :
+        station_to_close = response["track"][closed]
+        s1 = station_to_close["source"]
+        s2 = station_to_close["destination"]
+        
 
-    
-    twin = state["twin"].copy()
-    
-    twin_state = twin.get_state()
-    
-    train = twin_state["trains"]["T1"]
-    
-    tracks = twin_state["tracks"]
 
-    for track_id, track in tracks.items():
-        if track["closed"] or track_id in state["closed_tracks"]:
-            twin.close_track(track_id)
+        if G.has_edge(s1,s2):
+            G.remove_edge(s1,s2)
 
-    route = twin.find_route(
-        train["source"],
-        train["destination"],
-    )
+      
+        
+        for t  in trains:
+           route = trains[t]
+           if travels_directly(route,s1,s2):
+               rerouted_trains.append(t)
+               
+    for i in rerouted_trains:
+        
+        s1 = trains[i][0]
+        s2 = trains[i][-1]
+        path = nx.shortest(G,s1,s2)
 
-    state["routing_actions"] = [{
-        "type": "set_route",
-        "train_id": "T1",
-        "route": route,
+        state["routing_actions"].append = [{
+        
+        "train_id": i,
+        "route": path,
     
     }]
     return state
@@ -106,48 +209,18 @@ def routing_node(state: RailState):
 # =========================
 
 def planner_node(state: RailState):
-    plans = []
 
-    for track_action in state["track_actions"]:
-            for routing_action in state["routing_actions"]:
-                actions = [
-                 
-                    track_action,
-                    routing_action,
-                ]
 
-                plans.append({"actions": actions})
+    for i in state["routing_actions"]:
 
-    state["plans"] = plans
+        payload = {i["train_id"],i["route"]}
+
+        if i["type"] == "set_route":
+            response = requests.post(f"{BASE_URL}/api/train/reroute/",json=payload)
+
     return state
 
 
-# =========================
-# SIMULATION ENGINE
-# =========================
-
-def simulate_plan(twin: DigitalTwin, plan):
-    future = twin.copy()
-
-    for action in plan["actions"]:
-        future.apply_action(action)
-
-    return {
-        "plan": plan["actions"],
-        "delay": future.calculate_delay(),
-        "risk": future.calculate_risk(),
-        "future_state": future.get_state(),
-    }
-
-
-def simulation_node(state: RailState):
-    results = []
-
-    for plan in state["plans"]:
-        results.append(simulate_plan(state["twin"], plan))
-
-    state["simulation_results"] = results
-    return state
 
 
 # =========================
@@ -155,7 +228,9 @@ def simulation_node(state: RailState):
 # =========================
 
 def master_node(state: RailState):
+    
     best_score = -999
+    
     best_plan = {}
 
     for result in state["simulation_results"]:
@@ -166,8 +241,11 @@ def master_node(state: RailState):
             best_score = score
             best_plan = result
 
+    
     state["best_plan"] = best_plan
+    
     return state
+
 
 
 # =========================
