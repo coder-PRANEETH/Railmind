@@ -1,4 +1,4 @@
-@import "tailwindcss" source(none);
+@import "tailwindcss";
 @source "../src";
 @import "tw-animate-css";
 
@@ -39,10 +39,10 @@
 :root {
   --radius: 0.75rem;
   /* RailMind dark mission-control theme */
-  --background: oklch(0.16 0.03 260);          /* #050B18-ish */
+  --background: oklch(12.913% 0.00263 285.952);          /* #050B18-ish */
   --foreground: oklch(0.96 0.01 240);
   --panel: oklch(0.21 0.03 260);               /* #0E1726 */
-  --panel-2: oklch(0.25 0.035 260);
+  --panel-2: oklch(36.972% 0.17256 295.407);
   --card: oklch(0.21 0.03 260);
   --card-foreground: oklch(0.96 0.01 240);
   --popover: oklch(0.21 0.03 260);
@@ -72,7 +72,7 @@
   html, body { background-color: var(--color-background); color: var(--color-foreground); }
   body {
     background-image:
-      radial-gradient(1200px 600px at 10% -10%, oklch(0.35 0.08 250 / 0.25), transparent 60%),
+      radial-gradient(1200px 600px at 10% -10%, oklch(62.972% 0.20127 254.472 / 0.25), transparent 60%),
       radial-gradient(900px 500px at 100% 0%, oklch(0.4 0.12 145 / 0.12), transparent 60%);
     background-attachment: fixed;
   }
@@ -84,7 +84,7 @@
     backdrop-filter: blur(12px);
     border: 1px solid oklch(0.4 0.04 260 / 0.4);
   }
-  .glow-green { box-shadow: 0 0 0 1px oklch(0.72 0.18 145 / 0.45), 0 0 40px oklch(0.72 0.18 145 / 0.25); }
+  .glow-green { box-shadow: 0 0 0 1px oklch(67.661% 0.05514 147.526 / 0.45), 0 0 40px oklch(0.72 0.18 145 / 0.25); }
   .glow-red   { box-shadow: 0 0 0 1px oklch(0.65 0.23 25 / 0.5),  0 0 30px oklch(0.65 0.23 25 / 0.3); }
   .glow-blue  { box-shadow: 0 0 0 1px oklch(0.66 0.18 250 / 0.5), 0 0 30px oklch(0.66 0.18 250 / 0.25); }
   .text-success { color: var(--success); }
