@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { NetworkMap } from "./NetworkMap";
+import { TrainsPanel, getTrainRoute } from "./TrainsPanel";
 import {
   TRACKS,
   incidentSummary,
@@ -61,6 +62,7 @@ export function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<RunResponse | null>(null);
   const [trackId, setTrackId] = useState<string>("T23");
+  const [selectedTrain, setSelectedTrain] = useState<string | null>(null);
 
   async function doRun() {
     setLoading(true);
@@ -176,7 +178,7 @@ export function Dashboard() {
         </Card>
 
         {/* Map */}
-        <Card className="col-span-12 lg:col-span-9 p-0 glass overflow-hidden">
+        <Card className="col-span-12 lg:col-span-6 p-0 glass overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-border">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-info" />
@@ -185,15 +187,27 @@ export function Dashboard() {
             </div>
             <div className="text-[11px] text-muted-foreground font-mono-mc">
               {data?.failed_tracks?.length ?? 0} closed · {data?.rerouted_trains?.length ?? 0} rerouted
+              {selectedTrain && <span className="text-info"> · {selectedTrain} highlighted</span>}
             </div>
           </div>
           <div className="h-[520px]">
             <NetworkMap
               failedTracks={data?.failed_tracks ?? []}
               reroutedTrains={data?.rerouted_trains ?? []}
+              highlightedRoute={getTrainRoute(selectedTrain, data?.rerouted_trains ?? [])}
+              highlightedTrainId={selectedTrain}
             />
           </div>
         </Card>
+
+        {/* Trains */}
+        <div className="col-span-12 lg:col-span-3">
+          <TrainsPanel
+            selectedTrain={selectedTrain}
+            onSelect={setSelectedTrain}
+            reroutedTrains={data?.rerouted_trains ?? []}
+          />
+        </div>
 
         {/* Agent decisions */}
         <div className="col-span-12 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">

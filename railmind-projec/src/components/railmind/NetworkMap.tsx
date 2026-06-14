@@ -4,9 +4,11 @@ import { STATIONS, TRACKS, TRAINS, type Track } from "@/lib/railmind-mock";
 type Props = {
   failedTracks?: string[];
   reroutedTrains?: { id: string; newRoute: string[] }[];
+  highlightedRoute?: string[] | null;
+  highlightedTrainId?: string | null;
 };
 
-export function NetworkMap({ failedTracks = [], reroutedTrains = [] }: Props) {
+export function NetworkMap({ failedTracks = [], reroutedTrains = [], highlightedRoute = null, highlightedTrainId = null }: Props) {
   const [hoverStation, setHoverStation] = useState<string | null>(null);
   const [hoverTrack, setHoverTrack] = useState<string | null>(null);
 
@@ -103,6 +105,50 @@ export function NetworkMap({ failedTracks = [], reroutedTrains = [] }: Props) {
             />
           );
         })}
+
+        {/* Highlighted train route */}
+        {highlightedRoute && highlightedRoute.length >= 2 && (() => {
+          const pts = highlightedRoute.map((id) => stationById[id]).filter(Boolean);
+          if (pts.length < 2) return null;
+          const d = pts.map((pt, i) => `${i === 0 ? "M" : "L"} ${pt.x} ${pt.y}`).join(" ");
+          return (
+            <g>
+              <path
+                d={d}
+                fill="none"
+                stroke="var(--info)"
+                strokeWidth={8}
+                strokeOpacity={0.25}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <path
+                d={d}
+                fill="none"
+                stroke="var(--info)"
+                strokeWidth={3.5}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="dash-flow"
+                style={{ filter: "drop-shadow(0 0 8px var(--info))" }}
+              />
+              {pts.map((pt, i) => (
+                <circle key={i} cx={pt.x} cy={pt.y} r={6}
+                  fill="var(--info)" stroke="oklch(0.16 0.03 260)" strokeWidth={2}
+                  style={{ filter: "drop-shadow(0 0 6px var(--info))" }}
+                />
+              ))}
+              {highlightedTrainId && pts[0] && (
+                <text x={pts[0].x + 14} y={pts[0].y - 10}
+                  fill="var(--info)" fontSize={11} className="font-mono-mc" fontWeight={700}>
+                  {highlightedTrainId}
+                </text>
+              )}
+            </g>
+          );
+        })()}
+
+
 
         {/* Stations */}
         {STATIONS.map((s) => {

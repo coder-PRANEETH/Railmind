@@ -113,3 +113,7 @@
     to { stroke-dashoffset: -24; }
   }
 }
+
+.pulse-dot{
+  display:none;
+}
