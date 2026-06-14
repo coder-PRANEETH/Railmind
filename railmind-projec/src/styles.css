@@ -1,0 +1,115 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+}
+
+:root {
+  --radius: 0.75rem;
+  /* RailMind dark mission-control theme */
+  --background: oklch(0.16 0.03 260);          /* #050B18-ish */
+  --foreground: oklch(0.96 0.01 240);
+  --panel: oklch(0.21 0.03 260);               /* #0E1726 */
+  --panel-2: oklch(0.25 0.035 260);
+  --card: oklch(0.21 0.03 260);
+  --card-foreground: oklch(0.96 0.01 240);
+  --popover: oklch(0.21 0.03 260);
+  --popover-foreground: oklch(0.96 0.01 240);
+  --primary: oklch(0.72 0.18 145);             /* green */
+  --primary-foreground: oklch(0.16 0.03 260);
+  --secondary: oklch(0.28 0.035 260);
+  --secondary-foreground: oklch(0.96 0.01 240);
+  --muted: oklch(0.28 0.035 260);
+  --muted-foreground: oklch(0.72 0.02 250);
+  --accent: oklch(0.3 0.05 260);
+  --accent-foreground: oklch(0.96 0.01 240);
+  --destructive: oklch(0.65 0.23 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --border: oklch(0.32 0.04 260 / 60%);
+  --input: oklch(0.3 0.04 260);
+  --ring: oklch(0.6 0.18 230);
+
+  --success: oklch(0.72 0.18 145);   /* #22C55E */
+  --warning: oklch(0.78 0.17 85);    /* #EAB308 */
+  --danger:  oklch(0.65 0.23 25);    /* #EF4444 */
+  --info:    oklch(0.66 0.18 250);   /* #3B82F6 */
+}
+
+@layer base {
+  * { border-color: var(--color-border); }
+  html, body { background-color: var(--color-background); color: var(--color-foreground); }
+  body {
+    background-image:
+      radial-gradient(1200px 600px at 10% -10%, oklch(0.35 0.08 250 / 0.25), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, oklch(0.4 0.12 145 / 0.12), transparent 60%);
+    background-attachment: fixed;
+  }
+}
+
+@layer utilities {
+  .glass {
+    background: linear-gradient(180deg, oklch(0.24 0.035 260 / 0.7), oklch(0.2 0.03 260 / 0.55));
+    backdrop-filter: blur(12px);
+    border: 1px solid oklch(0.4 0.04 260 / 0.4);
+  }
+  .glow-green { box-shadow: 0 0 0 1px oklch(0.72 0.18 145 / 0.45), 0 0 40px oklch(0.72 0.18 145 / 0.25); }
+  .glow-red   { box-shadow: 0 0 0 1px oklch(0.65 0.23 25 / 0.5),  0 0 30px oklch(0.65 0.23 25 / 0.3); }
+  .glow-blue  { box-shadow: 0 0 0 1px oklch(0.66 0.18 250 / 0.5), 0 0 30px oklch(0.66 0.18 250 / 0.25); }
+  .text-success { color: var(--success); }
+  .text-warning { color: var(--warning); }
+  .text-danger  { color: var(--danger); }
+  .text-info    { color: var(--info); }
+  .bg-success { background-color: var(--success); }
+  .bg-warning { background-color: var(--warning); }
+  .bg-danger  { background-color: var(--danger); }
+  .bg-info    { background-color: var(--info); }
+  .stroke-success { stroke: var(--success); }
+  .stroke-warning { stroke: var(--warning); }
+  .stroke-danger  { stroke: var(--danger); }
+  .stroke-info    { stroke: var(--info); }
+  .font-mono-mc { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+  .pulse-dot { animation: mc-pulse 1.6s ease-in-out infinite; }
+  @keyframes mc-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.8); }
+  }
+  .dash-flow {
+    stroke-dasharray: 6 6;
+    animation: mc-dash 1.2s linear infinite;
+  }
+  @keyframes mc-dash {
+    to { stroke-dashoffset: -24; }
+  }
+}
