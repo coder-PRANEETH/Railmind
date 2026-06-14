@@ -89,6 +89,8 @@ export type RunResponse = {
   rerouted_trains: { id: string; newRoute: string[] }[];
 };
 
+const API_BASE_URL = "https://railmind-okf6.onrender.com";
+
 function nowHMS(offset = 0) {
   const d = new Date(Date.now() + offset * 1000);
   return d.toTimeString().slice(0, 8);
@@ -189,14 +191,14 @@ async function tryFetch(url: string, init?: RequestInit): Promise<unknown | null
 }
 
 export async function runSimulation(): Promise<RunResponse> {
-  const real = await tryFetch("/run", { method: "POST" });
+  const real = await tryFetch(`${API_BASE_URL}/run`, { method: "POST" });
   if (real && typeof real === "object") return real as RunResponse;
   await new Promise((r) => setTimeout(r, 600));
   return buildMockRun();
 }
 
 export async function injectTrackFailure(trackId: string): Promise<RunResponse> {
-  const real = await tryFetch(`/simulate-track-failure/${trackId}`, { method: "POST" });
+  const real = await tryFetch(`${API_BASE_URL}/simulate-track-failure/${trackId}`, { method: "POST" });
   if (real && typeof real === "object") return real as RunResponse;
   await new Promise((r) => setTimeout(r, 600));
   return buildMockRun(trackId);
