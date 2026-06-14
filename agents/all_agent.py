@@ -39,7 +39,7 @@ from fastapi import FastAPI, HTTPException
 from langgraph.graph import END, StateGraph
 
 app = FastAPI(title="RailMind")
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = "https://railmind-backend-4pep.onrender.com"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
