@@ -230,6 +230,30 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
             settle(WORK_PENDING, f"{item.target} has not taken the alternate corridor yet.")
         return
 
+    if item.kind == "repair_track":
+        track = tracks.get(item.target)
+        if track is None:
+            settle(WORK_FAILED, f"Track {item.target} is no longer present in the twin.")
+        elif track.get("status") == "OPEN" and track.get("health", 0.0) >= 0.99:
+            settle(WORK_DONE, f"Track {item.target} repair verified on the twin.")
+        else:
+            settle(WORK_PENDING, f"Track {item.target} repair is not yet verified.")
+        return
+
+    if item.kind == "restore_signal":
+        signal = snapshot.get("signals", {}).get(item.target)
+        if signal == "GREEN":
+            settle(WORK_DONE, f"Signal {item.target} restoration verified on the twin.")
+        else:
+            settle(WORK_PENDING, f"Signal {item.target} is not yet restored.")
+        return
+
+    if item.kind == "dispatch_crew":
+        # Dispatch acceptance is a backend commitment; the repair item is what
+        # proves the physical work actually completed.
+        settle(WORK_DONE, f"Crew dispatch for {item.target} accepted.")
+        return
+
     if item.kind == "hold":
         train = trains.get(item.target)
         if train is None:
@@ -287,6 +311,7 @@ class Incident:
     # Recomputed on every observe(); never trusted across calls.
     dispositions: Dict[str, str] = field(default_factory=dict)
     drivers: List[dict] = field(default_factory=list)
+    work_order_id: Optional[str] = None
 
     def move_to(self, level: int, reason: str, now: float) -> None:
         if level == self.level:
@@ -650,6 +675,30 @@ class IncidentLedger:
                             f"Weather protocol: close {track_id}", snapshot, now))
         return created
 
+    def record_work_order(self, work_order: dict, snapshot: dict, now: Optional[float] = None) -> List[WorkItem]:
+        now = time.time() if now is None else now
+        created = []
+        plan_id = work_order.get("plan_id") or "?"
+        for task in work_order.get("tasks", []):
+            action = task.get("action")
+            target = task.get("target", "")
+            mapping = {
+                "CLOSE_TRACK": ("close_track", f"Close {target}"),
+                "REROUTE_TRAIN": ("reroute", f"Reroute {target}"),
+                "HOLD_TRAIN": ("hold", f"Hold {target} short of the failure"),
+                "DISPATCH_CREW": ("dispatch_crew", f"Dispatch crew to {target}"),
+                "REPAIR_TRACK": ("repair_track", f"Repair {target}"),
+                "RESTORE_SIGNAL": ("restore_signal", f"Restore signal {target}"),
+            }
+            if action not in mapping:
+                continue
+            kind, label = mapping[action]
+            item = self._add_item(plan_id, kind, target, label, snapshot, now)
+            if action == "REROUTE_TRAIN":
+                item.expected_route = list(task.get("metadata", {}).get("new_route", []))
+            created.append(item)
+        return created
+
     def _add_item(self, plan_id: str, kind: str, target: str, label: str,
                   snapshot: dict, now: float, old_route: Sequence[str] = ()) -> WorkItem:
         # Keyed by kind+target: re-executing the same plan must update the
@@ -718,6 +767,16 @@ class IncidentLedger:
             f"Acknowledged by {owner} at {TIER_BY_LEVEL[incident.level].code}; "
             "dwell timer restarted.", "acknowledged"))
         return incident
+
+    def attach_work_order(self, work_order_id: str, incident_id: Optional[str] = None) -> None:
+        """Associate a committed WorkOrder with the incident it resolves."""
+        if incident_id and incident_id in self._incidents:
+            self._incidents[incident_id].work_order_id = work_order_id
+            return
+        open_incidents = self.open_incidents()
+        if open_incidents:
+            target = max(open_incidents, key=lambda i: i.level)
+            target.work_order_id = work_order_id
 
     def get(self, incident_id: str) -> Optional[Incident]:
         return self._incidents.get(incident_id)
@@ -791,6 +850,7 @@ class IncidentLedger:
             "peak_code": TIER_BY_LEVEL[incident.peak_level].code,
             "resolution": incident.resolution,
             "resolution_reason": incident.resolution_reason,
+        "work_order_id": incident.work_order_id,
             "acknowledged_by": incident.acknowledged_by,
             "age_seconds": round(now - incident.opened_at, 1),
             "tier_age_seconds": round(now - max(incident.tier_since,

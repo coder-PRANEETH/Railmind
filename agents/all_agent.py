@@ -59,6 +59,7 @@ for _path in (REPO_ROOT, AGENTS_DIR):
 
 import escalation as esc                      # noqa: E402  (needs sys.path above)
 from briefing import handoff_brief            # noqa: E402
+from workorder import build_work_order           # noqa: E402
 
 app = FastAPI(
     title="RailMind Agents",
@@ -291,11 +292,15 @@ class RailState(TypedDict):
     track_strategies:       List[dict]
     signal_strategies:      List[dict]
     routing_strategies:     List[dict]
+    escalation_analysis:    dict
+    field_requirements:     List[dict]
+    field_resources:        dict
 
     # ── orchestration ──
     plans:                  List[dict]              # Planner output
     simulation_results:     List[dict]              # Simulation output
     best_plan:              dict                    # Master output
+    work_order:             dict                    # Master/WorkOrder Builder output
     escalation:             dict                    # Escalation output
 
     log:                    List[dict]              # {t, source, message}
@@ -344,6 +349,11 @@ def weather_node(state: RailState) -> RailState:
             risk_map[track_id] = round(risk, 1)
 
     state["weather_risk"] = risk_map
+    field_access = {}
+    for track_id, risk in risk_map.items():
+        condition = weather.get(track_id, "CLEAR") if isinstance(weather, dict) else "UNKNOWN"
+        cond = condition.value if hasattr(condition, "value") else str(condition)
+        field_access[track_id] = "BLOCKED" if risk > 70 else ("RESTRICTED" if risk > 40 else "OPEN")
 
     high_tracks   = [t for t, r in risk_map.items() if r > 70]
     medium_tracks = [t for t, r in risk_map.items() if 40 < r <= 70]
@@ -382,6 +392,9 @@ def weather_node(state: RailState) -> RailState:
             actions=["no_weather_action_required"],
         )]
 
+    for strategy in strategies:
+        strategy["field_access"] = {t: field_access.get(t, "OPEN") for t in risk_map}
+        strategy["weather_field_access"] = field_access
     state["weather_strategies"] = strategies
 
     high_str = ", ".join(f"{t} ({r:.0f}%)" for t, r in risk_map.items() if r > 60)
@@ -410,6 +423,12 @@ def track_node(state: RailState) -> RailState:
                 "strategy_id": f"T_CLOSE_{track_id}",
                 "track_id": track_id,
                 "action": "close_track",
+                "condition": "CRITICAL",
+                "operational_action": "CLOSE_TRACK",
+                "field_intervention": {
+                    "required": True, "action": "REPAIR_TRACK", "target": track_id,
+                    "estimated_ticks": 20,
+                },
             })
         elif health <= 0.5:
             strategies.append({
@@ -466,6 +485,10 @@ def signal_node(state: RailState) -> RailState:
                     f"dispatch_signal_tech_{track_id}_ETA_20min",
                 ],
             ))
+            strategies[-1]["field_intervention"] = {
+                "required": True, "action": "RESTORE_SIGNAL", "target": track_id,
+                "estimated_ticks": 10,
+            }
         elif risk_score > 0.35:
             strategies.append(_strategy(
                 f"S_YELLOW_{sid_base}",
@@ -583,6 +606,70 @@ def routing_node(state: RailState) -> RailState:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ESCALATION ANALYSIS / FIELD REQUIREMENTS
+# Deterministic aggregation of specialist outputs. The LLM is never the source
+# of truth for whether physical intervention is required.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def escalation_analysis_node(state: RailState) -> RailState:
+    track = state["track_strategies"]
+    signal = state["signal_strategies"]
+    weather = state["weather_risk"]
+    routing = state["routing_strategies"]
+    trains = state["snapshot"].get("trains", {})
+
+    score = 0
+    if any(s.get("field_intervention", {}).get("required") for s in track):
+        score += 35
+    if any(s.get("field_intervention", {}).get("required") for s in signal):
+        score += 25
+    if any(r > 70 for r in weather.values()):
+        score += 20
+    if any(s.get("strategy_id", "").startswith("R_HOLD_") for s in routing):
+        score += 15
+    affected_passengers = sum(
+        trains.get(s.get("train_id"), {}).get("passengers", 0)
+        for s in routing if s.get("strategy_id", "").startswith(("R_REROUTE_", "R_HOLD_"))
+    )
+    if affected_passengers >= 500:
+        score += 10
+    if any(s.get("strategy_id", "").startswith("R_HOLD_") for s in routing) and not any(
+        s.get("strategy_id", "").startswith("R_REROUTE_") for s in routing
+    ):
+        score += 15
+    score = min(100, score)
+    priority = "CRITICAL" if score >= 80 else "HIGH" if score >= 60 else "MEDIUM" if score >= 30 else "LOW"
+
+    requirements = []
+    for s in track:
+        req = s.get("field_intervention")
+        if req and req.get("required"):
+            requirements.append(dict(req, target=s.get("track_id")))
+    for s in signal:
+        req = s.get("field_intervention")
+        if req and req.get("required"):
+            requirements.append(dict(req, target=s.get("track_id")))
+
+    resources = {
+        "repair_crews": int(os.environ.get("REPAIR_CREWS", "2")),
+        "signal_crews": int(os.environ.get("SIGNAL_CREWS", "1")),
+    }
+    state["field_requirements"] = requirements
+    state["field_resources"] = resources
+    state["escalation_analysis"] = {
+        "escalation_required": score >= 30,
+        "necessity_score": score,
+        "priority": priority,
+        "field_intervention": bool(requirements),
+        "requirements": requirements,
+        "affected_passengers": affected_passengers,
+    }
+    _log(state, "Escalation Analysis",
+         f"necessity {score}/100 · {priority} · {len(requirements)} field requirement(s)")
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PLANNER AGENT
 # Reads  : all specialist strategies
 # Outputs: 3 candidate plans
@@ -596,6 +683,8 @@ def planner_node(state: RailState) -> RailState:
     track   = state["track_strategies"]
     signal  = state["signal_strategies"]
     routing = state["routing_strategies"]
+    requirements = state.get("field_requirements", [])
+    resources = state.get("field_resources", {"repair_crews": 2, "signal_crews": 1})
 
     # Weather strategies follow each plan's doctrine — bundling all of them
     # into every plan would let an approved "Minimal Intervention" still close
@@ -643,8 +732,42 @@ def planner_node(state: RailState) -> RailState:
         },
     ]
 
+    # Field-work doctrine makes the three plans materially different. Minimal
+    # intervention explicitly records deferred work instead of pretending the
+    # incident is repaired.
+    for plan in plans:
+        plan["field_resources"] = resources
+        plan["field_requirements"] = list(requirements)
+        if plan["plan_id"] == "C":
+            plan["deferred_work"] = [
+                f"{r.get('action')}({r.get('target')})" for r in requirements
+            ]
+            plan["risk_of_future_block"] = "HIGH" if requirements else "LOW"
+        else:
+            plan["deferred_work"] = []
+            plan["risk_of_future_block"] = "LOW"
+
+    # A uses all available field crews in parallel, B allocates one work item
+    # at a time, C defers physical work. ETTR is deterministic and includes
+    # field-task durations.
+    for plan in plans:
+        field = [] if plan["plan_id"] == "C" else requirements
+        durations = [int(r.get("estimated_ticks", 0)) for r in field]
+        if plan["plan_id"] == "A":
+            crew_count = max(resources.get("repair_crews", 1), 1)
+            repair_durations = [d for r, d in zip(field, durations) if r.get("action") == "REPAIR_TRACK"]
+            signal_durations = [d for r, d in zip(field, durations) if r.get("action") == "RESTORE_SIGNAL"]
+            parallel_repair = max(repair_durations, default=0) if crew_count > 1 else sum(repair_durations)
+            parallel_signal = max(signal_durations, default=0) if resources.get("signal_crews", 1) > 0 else sum(signal_durations)
+            plan["ettr_ticks"] = max(parallel_repair, parallel_signal, 0) + (2 if any(a.get("strategy_id", "").startswith("R_REROUTE_") for a in plan["actions"] if isinstance(a, dict)) else 0)
+        elif plan["plan_id"] == "B":
+            plan["ettr_ticks"] = sum(durations) + (2 if any(a.get("strategy_id", "").startswith("R_REROUTE_") for a in plan["actions"] if isinstance(a, dict)) else 0)
+        else:
+            plan["ettr_ticks"] = 0
+        plan["field_tasks"] = len(field)
+
     state["plans"] = plans
-    _log(state, "Planner", f"generated {len(plans)} candidate plans (A safety-first, B balanced, C minimal)")
+    _log(state, "Planner", f"generated {len(plans)} candidate plans (A safety-first, B balanced, C minimal) with ETTR")
     return state
 
 
@@ -804,6 +927,14 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
                 delay += 25 if cond_risk > 70 else 10
                 passenger_impact += train.get("passengers", 0)
 
+    # Physical work affects recovery time and residual risk. Plan C does not
+    # perform field work; its deferred work is explicitly penalised.
+    ettr = int(plan.get("ettr_ticks", 0))
+    field_tasks = int(plan.get("field_tasks", 0))
+    delay += ettr
+    if plan.get("deferred_work"):
+        risk += 0.15 + 0.05 * len(plan["deferred_work"])
+
     risk = max(0.0, min(1.0, risk))
     congestion = round(min(congestion, 1.0), 2)
 
@@ -814,6 +945,9 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
         "risk": round(risk, 2),
         "passenger_impact": passenger_impact,
         "congestion": congestion,
+        "ettr_ticks": ettr,
+        "field_tasks": field_tasks,
+        "deferred_work": list(plan.get("deferred_work", [])),
     }
 
 
@@ -861,6 +995,21 @@ def master_node(state: RailState) -> RailState:
     ranked = sorted(results, key=lambda r: r["score"], reverse=True)
     best_plan = ranked[0]
     state["best_plan"] = best_plan
+    selected_plan = next(p for p in state["plans"] if p["plan_id"] == best_plan["plan_id"])
+    meaningful_actions = [
+        a for a in selected_plan.get("actions", [])
+        if isinstance(a, dict) and a.get("strategy_id", "") not in {"T_OK", "R_NOMINAL"}
+        and not a.get("strategy_id", "").startswith("S_GREEN")
+    ]
+    if meaningful_actions or state.get("field_requirements"):
+        state["work_order"] = build_work_order(
+            {**selected_plan, **best_plan},
+            incident_id=None,
+            field_requirements=state.get("field_requirements", []),
+            resources=state.get("field_resources"),
+        )
+    else:
+        state["work_order"] = {}
 
     _log(state, "Master",
          f"selected {best_plan['plan_name']} (score {best_plan['score']}/100) | "
@@ -916,6 +1065,7 @@ for _name, _fn in [
     ("track",      track_node),
     ("signal",     signal_node),
     ("routing",    routing_node),
+    ("escalation_analysis", escalation_analysis_node),
     ("planner",    planner_node),
     ("simulation", simulation_node),
     ("master",     master_node),
@@ -929,7 +1079,8 @@ for _a, _b in [
     ("weather",    "track"),
     ("track",      "signal"),    # signal reads track health + weather risk
     ("signal",     "routing"),
-    ("routing",    "planner"),
+    ("routing",    "escalation_analysis"),
+    ("escalation_analysis", "planner"),
     ("planner",    "simulation"),
     ("simulation", "master"),
     ("master",     "escalation"),
@@ -953,9 +1104,13 @@ def _initial_state(snapshot: dict, extra_log: List[dict] | None = None) -> RailS
         track_strategies=[],
         signal_strategies=[],
         routing_strategies=[],
+        escalation_analysis={},
+        field_requirements=[],
+        field_resources={"repair_crews": 2, "signal_crews": 1},
         plans=[],
         simulation_results=[],
         best_plan={},
+        work_order={},
         escalation={},
         log=extra_log or [],
     )
@@ -1011,6 +1166,10 @@ def _plan_payload(result: dict, plan: dict) -> dict:
         "passengers_impacted": result["passenger_impact"],
         "congestion": result["congestion"],
         "score": result["score"],
+        "ettr_ticks": result.get("ettr_ticks", plan.get("ettr_ticks", 0)),
+        "field_tasks": result.get("field_tasks", plan.get("field_tasks", 0)),
+        "deferred_work": result.get("deferred_work", plan.get("deferred_work", [])),
+        "risk_of_future_block": plan.get("risk_of_future_block", "LOW"),
         "actions": action_labels,
         "failed_tracks": plan_failed,
         "rerouted_trains": plan_rerouted,
@@ -1162,12 +1321,85 @@ def _format_response(final: RailState, twin_source: str, use_llm: bool = True) -
         "rerouted_trains": rerouted_trains,
         "held_trains": held_trains,
         "trains": trains,
+        "escalation_analysis": final.get("escalation_analysis", {}),
+        "field_requirements": final.get("field_requirements", []),
+        "field_resources": final.get("field_resources", {}),
+        "work_order": final.get("work_order", {}),
         # Always present: /apply-plan re-grades the ledger after executing, and
         # a cached run replayed through this formatter must not serve the
         # escalation state as it stood before the actions landed.
         "escalation": final.get("escalation") or _observe(final["snapshot"]),
     }
 
+
+
+_LOCAL_WORK_ORDERS: dict = {}
+
+def _submit_work_order(work_order: dict, source: str) -> dict:
+    """Handoff to the backend. Embedded mode keeps a local accepted object so
+    the offline demo has the same contract as the deployed Django backend."""
+    if not work_order:
+        return {}
+    base = source if source and source != "embedded" else None
+    if base:
+        try:
+            resp = requests.post(f"{base}/api/work-orders/", json=work_order, timeout=4)
+            resp.raise_for_status()
+            body = resp.json()
+            return {**work_order, **body}
+        except (requests.RequestException, ValueError):
+            pass
+    _LOCAL_WORK_ORDERS[work_order["work_order_id"]] = dict(work_order)
+    return {**work_order, "status": "PENDING", "accepted": True, "backend": "embedded"}
+
+def _execute_work_order(work_order: dict, source: str) -> dict:
+    """Ask the backend to execute; never interpret acceptance as completion."""
+    wid = work_order.get("work_order_id")
+    if not wid:
+        return {}
+    base = source if source and source != "embedded" else None
+    if base:
+        try:
+            resp = requests.post(f"{base}/api/work-orders/{wid}/execute/", timeout=6)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError):
+            pass
+    # Offline backend equivalent: execute against the embedded twin, then verify.
+    executed = []
+    blocked = []
+    for task in work_order.get("tasks", []):
+        deps = set(task.get("depends_on", []))
+        if any(d not in executed for d in deps):
+            task["status"] = "BLOCKED"
+            blocked.append(task["id"])
+            continue
+        try:
+            action, target = task.get("action"), task.get("target")
+            if action == "CLOSE_TRACK":
+                _twin_close_track(target)
+            elif action == "REPAIR_TRACK":
+                with _embedded_lock: _get_embedded_twin().repair_track(target)
+            elif action == "RESTORE_SIGNAL":
+                with _embedded_lock: _get_embedded_twin().restore_signal(target)
+            elif action == "REROUTE_TRAIN":
+                _twin_reroute_train(target, task.get("metadata", {}).get("new_route", []))
+            elif action == "HOLD_TRAIN":
+                with _embedded_lock: _get_embedded_twin().state.trains[target].held = True
+            elif action == "DISPATCH_CREW":
+                pass
+            else:
+                raise ValueError(action)
+            task["status"] = "COMPLETE"
+            executed.append(task["id"])
+        except Exception as exc:
+            task["status"] = "FAILED"
+            task["verification"] = str(exc)
+            blocked.append(task["id"])
+    status_value = "COMPLETE" if len(executed) == len(work_order.get("tasks", [])) else ("PARTIAL" if executed else "BLOCKED")
+    work_order["status"] = status_value
+    _LOCAL_WORK_ORDERS[wid] = work_order
+    return {"work_order_id": wid, "status": status_value, "executed_tasks": executed, "blocked_tasks": blocked, "accepted": True}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAST RUN CACHE
@@ -1207,7 +1439,7 @@ def health():
         "endpoints": [
             "/state", "/run", "/run-stream", "/apply-plan", "/reset",
             "/simulate-track-failure/{track_id}", "/simulate-weather/{track_id}",
-            "/escalation", "/incidents/{incident_id}/acknowledge",
+            "/escalation", "/api/work-orders/", "/incidents/{incident_id}/acknowledge",
             "/incidents/{incident_id}/brief", "/docs",
         ],
     }
@@ -1328,6 +1560,11 @@ def run_pipeline():
     """Fetch the digital twin state and run the full agent pipeline."""
     snapshot, source = fetch_snapshot()
     final = pipeline.invoke(_initial_state(snapshot))
+    wo = _submit_work_order(final.get("work_order", {}), source)
+    final["work_order"] = wo
+    with _ledger_lock:
+        _LEDGER.attach_work_order(wo.get("work_order_id"))
+        final["escalation"] = _LEDGER.observe(final["snapshot"])
     _record_run(final, source)
     return _format_response(final, source)
 
@@ -1391,6 +1628,11 @@ def run_pipeline_stream(inject_track: str | None = None, weather_track: str | No
                         emitted += 1
                         time.sleep(0.15)  # let the timeline animate
 
+            wo = _submit_work_order(final_state.get("work_order", {}), source)
+            final_state["work_order"] = wo
+            with _ledger_lock:
+                _LEDGER.attach_work_order(wo.get("work_order_id"))
+                final_state["escalation"] = _LEDGER.observe(final_state["snapshot"])
             payload = _format_response(final_state, source)
             _record_run(final_state, source)
             yield _sse("result", payload)
@@ -1430,6 +1672,10 @@ def simulate_track_failure(track_id: str):
         "message": f"[INJECTED] Track {track_id} failure detected — closed",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
+    wo = _submit_work_order(final.get("work_order", {}), source)
+    final["work_order"] = wo
+    with _ledger_lock:
+        _LEDGER.attach_work_order(wo.get("work_order_id"))
     _record_run(final, source)
     return {"injected_failure": track_id, **_format_response(final, source)}
 
@@ -1460,6 +1706,10 @@ def simulate_weather(track_id: str, condition: str = "STORM"):
         "message": f"[INJECTED] {condition} reported on track {track_id}",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
+    wo = _submit_work_order(final.get("work_order", {}), source)
+    final["work_order"] = wo
+    with _ledger_lock:
+        _LEDGER.attach_work_order(wo.get("work_order_id"))
     _record_run(final, source)
     return {"injected_weather": {"track_id": track_id, "condition": condition},
             **_format_response(final, source)}
@@ -1499,34 +1749,37 @@ def apply_plan(plan_id: str | None = None):
     applied = []
     apply_error = None
     try:
-        for action in plan["actions"]:
+        work_order = final.get("work_order") or build_work_order(
+            plan, field_requirements=final.get("field_requirements", []),
+            resources=final.get("field_resources", {"repair_crews": 2, "signal_crews": 1})
+        )
+        work_order = _submit_work_order(work_order, source)
+        execution = _execute_work_order(work_order, source)
+        final["work_order"] = {**work_order, **execution}
+        executed_ids = set(execution.get("executed_tasks", []))
+        applied = [f"WorkOrder task {tid} accepted" for tid in execution.get("executed_tasks", [])]
+        # Preserve the legacy operator-console action labels while exposing the
+        # new WorkOrder status separately.
+        for action in plan.get("actions", []):
             if not isinstance(action, dict):
                 continue
             sid = action.get("strategy_id", "")
-            if sid.startswith("T_CLOSE_"):
-                _twin_close_track(action["track_id"])
-                applied.append(f"Closed track {action['track_id']}")
-            elif sid.startswith("R_REROUTE_"):
-                _twin_reroute_train(action["train_id"], action["new_route"])
+            if sid.startswith("R_REROUTE_") and any(t.get("action") == "REROUTE_TRAIN" and t.get("target") == action.get("train_id") and t.get("id") in executed_ids for t in final["work_order"].get("tasks", [])):
                 applied.append(f"Rerouted {action['train_id']}")
-            elif sid.startswith("W"):
-                # Weather protocols advertise closures inside action strings
-                # like "close_track_T05+reroute_all_trains" — execute them.
-                for act in action.get("actions", []):
-                    if act.startswith("close_track_"):
-                        track_id = act.removeprefix("close_track_").split("+")[0]
-                        _twin_close_track(track_id)
-                        applied.append(f"Closed track {track_id} (weather protocol {sid})")
-    except requests.RequestException as e:
-        # Actions already applied changed the twin — a 502 here would hide
-        # them, so report the partial execution instead.
+            elif sid.startswith("T_CLOSE_") and any(t.get("action") == "CLOSE_TRACK" and t.get("target") == action.get("track_id") and t.get("id") in executed_ids for t in final["work_order"].get("tasks", [])):
+                applied.append(f"Closed track {action['track_id']}")
+        if execution.get("status") in ("PARTIAL", "BLOCKED"):
+            apply_error = RuntimeError(f"WorkOrder {work_order.get('work_order_id')} status {execution.get('status')}")
+    except Exception as e:
         apply_error = e
 
     if apply_error is None:
-        message = f"Plan {target_id} executed on the live twin: {len(applied)} action(s)"
+        message = (f"Plan {target_id} handed to WorkOrder {final.get('work_order', {}).get('work_order_id')}; "
+                   "execution accepted and verification remains authoritative")
     else:
-        message = (f"Plan {target_id} partially executed: {len(applied)} action(s) "
-                   f"applied before the twin became unreachable: {apply_error}")
+        message = (f"Plan {target_id} handed to WorkOrder {final.get('work_order', {}).get('work_order_id')}; "
+                   f"execution status requires verification: {apply_error}")
+
     final["log"].append({
         "t": time.strftime("%H:%M:%S"),
         "source": "Executor",
@@ -1539,7 +1792,7 @@ def apply_plan(plan_id: str | None = None):
     # outstanding work, not vanish from the checklist.
     post_snapshot, source = fetch_snapshot()
     with _ledger_lock:
-        _LEDGER.record_dispatch(target_id, plan["actions"], post_snapshot)
+        _LEDGER.record_work_order(final.get("work_order", {}), post_snapshot)
         graded = _LEDGER.observe(post_snapshot)
     final["escalation"] = graded
     final["snapshot"] = post_snapshot
