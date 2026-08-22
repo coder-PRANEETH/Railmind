@@ -278,6 +278,111 @@ def _twin_reset() -> None:
         _drop_probe_snapshot()
 
 
+# ── work orders ──────────────────────────────────────────────────────────────
+# Field work lives in the twin. These helpers give the same verbs against a
+# remote twin (its /api/workorders/ endpoints) and the embedded one; either
+# way the twin's own answer — including its refusals — is what comes back.
+
+MAX_TICKS_PER_REQUEST = 200
+
+
+def _remote_twin_call(method: str, path: str, base: str, json: dict | None = None,
+                      timeout: float = 4) -> dict:
+    """One call to the remote twin. Its 400/404 answers are passed through
+    as the same status with its message; network failures propagate as
+    requests.RequestException for the caller to report as 502."""
+    resp = requests.request(method, f"{base}{path}", json=json, timeout=timeout)
+    if resp.status_code in (400, 404, 409):
+        try:
+            detail = resp.json().get("error") or resp.text
+        except ValueError:
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    resp.raise_for_status()
+    _drop_probe_snapshot()
+    return resp.json()
+
+
+def _twin_work_orders() -> list:
+    base = _twin_base()
+    if base:
+        return _remote_twin_call("GET", "/api/workorders/", base).get("work_orders", [])
+    with _embedded_lock:
+        return _get_embedded_twin().work_orders_payload()
+
+
+def _twin_register_incident_response(track_id: str, incident_id: str | None,
+                                     work_order_id: str | None = None) -> dict:
+    base = _twin_base()
+    if base:
+        body = {"template": "CRITICAL_INCIDENT_RESPONSE", "track_id": track_id,
+                "incident_id": incident_id, "id": work_order_id}
+        return _remote_twin_call("POST", "/api/workorders/", base, json=body)["work_order"]
+    with _embedded_lock:
+        twin = _get_embedded_twin()
+        try:
+            return twin.create_incident_response(
+                track_id, incident_id=incident_id, work_order_id=work_order_id).payload()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+def _twin_register_work_order(spec: dict) -> dict:
+    """Register an explicit order (id, incident_id, type, target, tasks) on
+    the twin; the twin validates targets, dependencies and cycles."""
+    base = _twin_base()
+    if base:
+        return _remote_twin_call("POST", "/api/workorders/", base, json=spec)["work_order"]
+    with _embedded_lock:
+        twin = _get_embedded_twin()
+        try:
+            return twin.register_work_order(spec).payload()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+def _twin_retry_work_order(work_order_id: str, task_id: str | None) -> dict:
+    base = _twin_base()
+    if base:
+        body = {"task_id": task_id} if task_id else {}
+        return _remote_twin_call("POST", f"/api/workorders/{work_order_id}/retry/", base,
+                                 json=body)["work_order"]
+    with _embedded_lock:
+        twin = _get_embedded_twin()
+        try:
+            twin.retry_task(work_order_id, task_id)
+            return twin.work_order_payload(work_order_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Work order '{work_order_id}' not found.")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+def _twin_cancel_work_order(work_order_id: str, reason: str) -> dict:
+    base = _twin_base()
+    if base:
+        return _remote_twin_call("POST", f"/api/workorders/{work_order_id}/cancel/", base,
+                                 json={"reason": reason})["work_order"]
+    with _embedded_lock:
+        twin = _get_embedded_twin()
+        try:
+            return twin.cancel_work_order(work_order_id, reason=reason).payload()
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Work order '{work_order_id}' not found.")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+def _twin_advance(ticks: int) -> dict:
+    base = _twin_base()
+    if base:
+        return _remote_twin_call("POST", "/api/tick/", base, json={"ticks": ticks}, timeout=10)
+    with _embedded_lock:
+        twin = _get_embedded_twin()
+        sim_tick = twin.advance_ticks(ticks)
+        return {"sim_tick": sim_tick, "work_orders": twin.work_orders_payload()}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -418,7 +523,7 @@ def track_node(state: RailState) -> RailState:
     for track_id, track in tracks.items():
         health = track.get("health", 1.0)
 
-        if health <= 0.2 or track.get("status") == "CLOSED":
+        if health <= 0.2 or track.get("status") in esc.IMPASSABLE_STATUSES:
             strategies.append({
                 "strategy_id": f"T_CLOSE_{track_id}",
                 "track_id": track_id,
@@ -795,11 +900,12 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
         elif health <= 0.7:
             risk += 0.05
 
-    # Edges of failed tracks (broken or closed) and which trains cross them
+    # Edges of failed tracks (broken, closed or being worked on) and which
+    # trains cross them
     failed_edges = {
         frozenset({t["source"], t["destination"]})
         for t in tracks.values()
-        if t.get("health", 1.0) <= 0.2 or t.get("status") == "CLOSED"
+        if t.get("health", 1.0) <= 0.2 or t.get("status") in esc.IMPASSABLE_STATUSES
     }
 
     def _crosses(route: List[str], edges) -> bool:
@@ -1005,7 +1111,10 @@ def master_node(state: RailState) -> RailState:
         state["work_order"] = build_work_order(
             {**selected_plan, **best_plan},
             incident_id=None,
-            field_requirements=state.get("field_requirements", []),
+            # Minimal Intervention defers physical work by doctrine: its
+            # proposal must not carry repairs it will not order.
+            field_requirements=[] if selected_plan.get("deferred_work")
+            else state.get("field_requirements", []),
             resources=state.get("field_resources"),
         )
     else:
@@ -1333,73 +1442,101 @@ def _format_response(final: RailState, twin_source: str, use_llm: bool = True) -
 
 
 
-_LOCAL_WORK_ORDERS: dict = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# WORK ORDER HAND-OFF
+# The Master Agent proposes a WorkOrder (agents/workorder.py): the operational
+# actions of the approved plan plus the field work the specialists say must
+# physically happen. The agent never executes it. Operational actions land on
+# the twin the moment the operator applies the plan; field tasks are handed to
+# the twin's work-order engine, which carries them out over ticks and is the
+# only thing that ever marks them complete.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tasks the twin executes as field work; everything else in a proposal is an
+# operational action /apply-plan performs directly, or a hold the ledger
+# verifies on the train.
+FIELD_ACTIONS = ("DISPATCH_CREW", "REPAIR_TRACK", "RESTORE_SIGNAL")
+
 
 def _submit_work_order(work_order: dict, source: str) -> dict:
-    """Handoff to the backend. Embedded mode keeps a local accepted object so
-    the offline demo has the same contract as the deployed Django backend."""
+    """Stamp a proposed WorkOrder for the console. Nothing is executed or
+    accepted here — that happens when the operator applies the plan."""
     if not work_order:
         return {}
-    base = source if source and source != "embedded" else None
-    if base:
-        try:
-            resp = requests.post(f"{base}/api/work-orders/", json=work_order, timeout=4)
-            resp.raise_for_status()
-            body = resp.json()
-            return {**work_order, **body}
-        except (requests.RequestException, ValueError):
-            pass
-    _LOCAL_WORK_ORDERS[work_order["work_order_id"]] = dict(work_order)
-    return {**work_order, "status": "PENDING", "accepted": True, "backend": "embedded"}
+    return {**work_order, "status": "PROPOSED", "backend": source or "embedded"}
 
-def _execute_work_order(work_order: dict, source: str) -> dict:
-    """Ask the backend to execute; never interpret acceptance as completion."""
-    wid = work_order.get("work_order_id")
-    if not wid:
-        return {}
-    base = source if source and source != "embedded" else None
-    if base:
-        try:
-            resp = requests.post(f"{base}/api/work-orders/{wid}/execute/", timeout=6)
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.RequestException, ValueError):
-            pass
-    # Offline backend equivalent: execute against the embedded twin, then verify.
-    executed = []
-    blocked = []
+
+def _twin_task(task: dict, field_ids: set) -> dict:
+    """A proposal task in the twin's registration format. Dependencies on
+    operational tasks are dropped: those actions have already landed."""
+    spec = {
+        "id": task["id"],
+        "action": task["action"],
+        "target": task["target"],
+        "depends_on": [d for d in task.get("depends_on", []) if d in field_ids],
+    }
+    ticks = int(task.get("estimated_ticks") or 0)
+    if ticks > 0:
+        spec["ticks_required"] = ticks
+    return spec
+
+
+def _dispatch_field_work(plan: dict, work_order: dict, graded: dict) -> tuple[list, list]:
+    """Hand the proposal's field tasks to the twin, one order per section,
+    unless field work is already live there.
+
+    A plan that defers physical work by doctrine (Minimal Intervention)
+    registers nothing. A proposal without field tasks falls back to the
+    twin's standard response for every failed section the plan closed.
+    Returns (orders registered, problems); a problem never fails the apply —
+    the operational actions are already on the twin and the ledger has the
+    work items — the log says which repair could not be ordered."""
+    if plan.get("deferred_work"):
+        return [], []
+
+    groups: dict = {}
     for task in work_order.get("tasks", []):
-        deps = set(task.get("depends_on", []))
-        if any(d not in executed for d in deps):
-            task["status"] = "BLOCKED"
-            blocked.append(task["id"])
+        if isinstance(task, dict) and task.get("action") in FIELD_ACTIONS and task.get("target"):
+            groups.setdefault(task["target"], []).append(task)
+    if not groups:
+        for action in plan.get("actions", []):
+            if isinstance(action, dict) and action.get("strategy_id", "").startswith("T_CLOSE_"):
+                groups.setdefault(action["track_id"], [])
+    if not groups:
+        return [], []
+
+    try:
+        live = _twin_work_orders()
+    except (requests.RequestException, HTTPException) as e:
+        return [], [f"could not list work orders: {getattr(e, 'detail', e)}"]
+    busy = {o.get("target") for o in live if o.get("status") in esc.FIELD_WORK_LIVE}
+    incident_by_track = {
+        i["track_id"]: i["id"] for i in graded.get("incidents", []) if not i.get("closed")
+    }
+
+    registered, problems = [], []
+    base_id = work_order.get("work_order_id")
+    for n, (track_id, tasks) in enumerate(groups.items()):
+        if track_id in busy:
             continue
+        order_id = (base_id if n == 0 else f"{base_id}-{n}") if base_id else None
+        incident_id = incident_by_track.get(track_id)
         try:
-            action, target = task.get("action"), task.get("target")
-            if action == "CLOSE_TRACK":
-                _twin_close_track(target)
-            elif action == "REPAIR_TRACK":
-                with _embedded_lock: _get_embedded_twin().repair_track(target)
-            elif action == "RESTORE_SIGNAL":
-                with _embedded_lock: _get_embedded_twin().restore_signal(target)
-            elif action == "REROUTE_TRAIN":
-                _twin_reroute_train(target, task.get("metadata", {}).get("new_route", []))
-            elif action == "HOLD_TRAIN":
-                with _embedded_lock: _get_embedded_twin().state.trains[target].held = True
-            elif action == "DISPATCH_CREW":
-                pass
+            if tasks:
+                field_ids = {t["id"] for t in tasks}
+                registered.append(_twin_register_work_order({
+                    "id": order_id,
+                    "incident_id": incident_id,
+                    "type": work_order.get("type") or "CRITICAL_INCIDENT_RESPONSE",
+                    "target": track_id,
+                    "tasks": [_twin_task(t, field_ids) for t in tasks],
+                }))
             else:
-                raise ValueError(action)
-            task["status"] = "COMPLETE"
-            executed.append(task["id"])
-        except Exception as exc:
-            task["status"] = "FAILED"
-            task["verification"] = str(exc)
-            blocked.append(task["id"])
-    status_value = "COMPLETE" if len(executed) == len(work_order.get("tasks", [])) else ("PARTIAL" if executed else "BLOCKED")
-    work_order["status"] = status_value
-    _LOCAL_WORK_ORDERS[wid] = work_order
-    return {"work_order_id": wid, "status": status_value, "executed_tasks": executed, "blocked_tasks": blocked, "accepted": True}
+                registered.append(_twin_register_incident_response(track_id, incident_id, order_id))
+        except (requests.RequestException, HTTPException) as e:
+            problems.append(f"{track_id}: {getattr(e, 'detail', e)}")
+    return registered, problems
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAST RUN CACHE
@@ -1439,8 +1576,11 @@ def health():
         "endpoints": [
             "/state", "/run", "/run-stream", "/apply-plan", "/reset",
             "/simulate-track-failure/{track_id}", "/simulate-weather/{track_id}",
-            "/escalation", "/api/work-orders/", "/incidents/{incident_id}/acknowledge",
-            "/incidents/{incident_id}/brief", "/docs",
+            "/escalation", "/incidents/{incident_id}/acknowledge",
+            "/incidents/{incident_id}/brief",
+            "/workorders", "/workorders/incident-response/{track_id}",
+            "/workorders/{work_order_id}/retry", "/workorders/{work_order_id}/cancel",
+            "/workorders/tick", "/docs",
         ],
     }
 
@@ -1534,7 +1674,97 @@ def live_state():
         tid: (c.value if hasattr(c, "value") else str(c))
         for tid, c in (snapshot.get("weather") or {}).items()
     } if isinstance(snapshot.get("weather"), dict) else {}
-    return {"twin_source": source, "trains": trains, "tracks": tracks, "weather": weather}
+    return {
+        "twin_source": source,
+        "trains": trains,
+        "tracks": tracks,
+        "weather": weather,
+        # Field work the twin is carrying out; the console shows it next to
+        # the fleet so one poll covers both.
+        "sim_tick": snapshot.get("sim_tick", 0),
+        "work_orders": snapshot.get("work_orders") or [],
+        "crews": snapshot.get("crews") or {},
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORK ORDER ENDPOINTS
+# The console's window onto the twin's field work. Every verb is carried out
+# by the twin; this service only relays and attributes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _twin_source_label() -> str:
+    return _twin_base() or "embedded"
+
+
+@app.get("/workorders")
+def list_work_orders():
+    """Every work order on the live twin, with task progress and events."""
+    try:
+        orders = _twin_work_orders()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
+    return {"twin_source": _twin_source_label(), "work_orders": orders}
+
+
+@app.post("/workorders/tick")
+def advance_field_work(ticks: int = 1):
+    """Fast-forward the twin's simulation so field work plays out on demand."""
+    if ticks < 1 or ticks > MAX_TICKS_PER_REQUEST:
+        raise HTTPException(status_code=400,
+                            detail=f"ticks must be between 1 and {MAX_TICKS_PER_REQUEST}.")
+    try:
+        result = _twin_advance(ticks)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
+    snapshot, source = fetch_snapshot()
+    return {"status": "success", "twin_source": source, "ticks": ticks,
+            "sim_tick": result.get("sim_tick"), "work_orders": result.get("work_orders", []),
+            "escalation": _observe(snapshot)}
+
+
+@app.post("/workorders/incident-response/{track_id}")
+def dispatch_incident_response(track_id: str):
+    """Order the twin's standard response for a failed section — close it,
+    send a crew, rebuild it — attributed to the open incident on that
+    corridor. Refused while field work is already live there."""
+    snapshot, source = fetch_snapshot()
+    if track_id not in snapshot.get("tracks", {}):
+        raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
+    for order in snapshot.get("work_orders") or []:
+        if order.get("target") == track_id and order.get("status") in esc.FIELD_WORK_LIVE:
+            raise HTTPException(status_code=409,
+                                detail=f"Work order {order.get('id')} is already active on {track_id}.")
+    graded = _observe(snapshot)
+    incident_id = next((i["id"] for i in graded["incidents"]
+                        if i["track_id"] == track_id and not i["closed"]), None)
+    try:
+        order = _twin_register_incident_response(track_id, incident_id)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
+    snapshot, source = fetch_snapshot()
+    return {"status": "success", "twin_source": source, "work_order": order,
+            "escalation": _observe(snapshot)}
+
+
+@app.post("/workorders/{work_order_id}/retry")
+def retry_work_order(work_order_id: str, task_id: str | None = None):
+    """BLOCKED -> PENDING for one task, or every blocked task in the order."""
+    try:
+        order = _twin_retry_work_order(work_order_id, task_id)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
+    return {"status": "success", "twin_source": _twin_source_label(), "work_order": order}
+
+
+@app.post("/workorders/{work_order_id}/cancel")
+def cancel_work_order(work_order_id: str, reason: str = "Cancelled by operator"):
+    """Cancel an order; the twin aborts work in flight and puts assets back."""
+    try:
+        order = _twin_cancel_work_order(work_order_id, reason)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Twin unreachable: {e}")
+    return {"status": "success", "twin_source": _twin_source_label(), "work_order": order}
 
 
 @app.post("/reset")
@@ -1560,11 +1790,7 @@ def run_pipeline():
     """Fetch the digital twin state and run the full agent pipeline."""
     snapshot, source = fetch_snapshot()
     final = pipeline.invoke(_initial_state(snapshot))
-    wo = _submit_work_order(final.get("work_order", {}), source)
-    final["work_order"] = wo
-    with _ledger_lock:
-        _LEDGER.attach_work_order(wo.get("work_order_id"))
-        final["escalation"] = _LEDGER.observe(final["snapshot"])
+    final["work_order"] = _submit_work_order(final.get("work_order", {}), source)
     _record_run(final, source)
     return _format_response(final, source)
 
@@ -1628,11 +1854,7 @@ def run_pipeline_stream(inject_track: str | None = None, weather_track: str | No
                         emitted += 1
                         time.sleep(0.15)  # let the timeline animate
 
-            wo = _submit_work_order(final_state.get("work_order", {}), source)
-            final_state["work_order"] = wo
-            with _ledger_lock:
-                _LEDGER.attach_work_order(wo.get("work_order_id"))
-                final_state["escalation"] = _LEDGER.observe(final_state["snapshot"])
+            final_state["work_order"] = _submit_work_order(final_state.get("work_order", {}), source)
             payload = _format_response(final_state, source)
             _record_run(final_state, source)
             yield _sse("result", payload)
@@ -1672,10 +1894,7 @@ def simulate_track_failure(track_id: str):
         "message": f"[INJECTED] Track {track_id} failure detected — closed",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
-    wo = _submit_work_order(final.get("work_order", {}), source)
-    final["work_order"] = wo
-    with _ledger_lock:
-        _LEDGER.attach_work_order(wo.get("work_order_id"))
+    final["work_order"] = _submit_work_order(final.get("work_order", {}), source)
     _record_run(final, source)
     return {"injected_failure": track_id, **_format_response(final, source)}
 
@@ -1706,10 +1925,7 @@ def simulate_weather(track_id: str, condition: str = "STORM"):
         "message": f"[INJECTED] {condition} reported on track {track_id}",
     }]
     final = pipeline.invoke(_initial_state(snapshot, extra_log=injected_log))
-    wo = _submit_work_order(final.get("work_order", {}), source)
-    final["work_order"] = wo
-    with _ledger_lock:
-        _LEDGER.attach_work_order(wo.get("work_order_id"))
+    final["work_order"] = _submit_work_order(final.get("work_order", {}), source)
     _record_run(final, source)
     return {"injected_weather": {"track_id": track_id, "condition": condition},
             **_format_response(final, source)}
@@ -1749,51 +1965,97 @@ def apply_plan(plan_id: str | None = None):
     applied = []
     apply_error = None
     try:
-        work_order = final.get("work_order") or build_work_order(
-            plan, field_requirements=final.get("field_requirements", []),
-            resources=final.get("field_resources", {"repair_crews": 2, "signal_crews": 1})
-        )
-        work_order = _submit_work_order(work_order, source)
-        execution = _execute_work_order(work_order, source)
-        final["work_order"] = {**work_order, **execution}
-        executed_ids = set(execution.get("executed_tasks", []))
-        applied = [f"WorkOrder task {tid} accepted" for tid in execution.get("executed_tasks", [])]
-        # Preserve the legacy operator-console action labels while exposing the
-        # new WorkOrder status separately.
-        for action in plan.get("actions", []):
+        for action in plan["actions"]:
             if not isinstance(action, dict):
                 continue
             sid = action.get("strategy_id", "")
-            if sid.startswith("R_REROUTE_") and any(t.get("action") == "REROUTE_TRAIN" and t.get("target") == action.get("train_id") and t.get("id") in executed_ids for t in final["work_order"].get("tasks", [])):
-                applied.append(f"Rerouted {action['train_id']}")
-            elif sid.startswith("T_CLOSE_") and any(t.get("action") == "CLOSE_TRACK" and t.get("target") == action.get("track_id") and t.get("id") in executed_ids for t in final["work_order"].get("tasks", [])):
+            if sid.startswith("T_CLOSE_"):
+                _twin_close_track(action["track_id"])
                 applied.append(f"Closed track {action['track_id']}")
-        if execution.get("status") in ("PARTIAL", "BLOCKED"):
-            apply_error = RuntimeError(f"WorkOrder {work_order.get('work_order_id')} status {execution.get('status')}")
-    except Exception as e:
+            elif sid.startswith("R_REROUTE_"):
+                _twin_reroute_train(action["train_id"], action["new_route"])
+                applied.append(f"Rerouted {action['train_id']}")
+            elif sid.startswith("W"):
+                # Weather protocols advertise closures inside action strings
+                # like "close_track_T05+reroute_all_trains" — execute them.
+                for act in action.get("actions", []):
+                    if act.startswith("close_track_"):
+                        track_id = act.removeprefix("close_track_").split("+")[0]
+                        _twin_close_track(track_id)
+                        applied.append(f"Closed track {track_id} (weather protocol {sid})")
+    except requests.RequestException as e:
+        # Actions already applied changed the twin — a 502 here would hide
+        # them, so report the partial execution instead.
         apply_error = e
 
     if apply_error is None:
-        message = (f"Plan {target_id} handed to WorkOrder {final.get('work_order', {}).get('work_order_id')}; "
-                   "execution accepted and verification remains authoritative")
+        message = f"Plan {target_id} executed on the live twin: {len(applied)} action(s)"
     else:
-        message = (f"Plan {target_id} handed to WorkOrder {final.get('work_order', {}).get('work_order_id')}; "
-                   f"execution status requires verification: {apply_error}")
-
+        message = (f"Plan {target_id} partially executed: {len(applied)} action(s) "
+                   f"applied before the twin became unreachable: {apply_error}")
     final["log"].append({
         "t": time.strftime("%H:%M:%S"),
         "source": "Executor",
         "message": message,
     })
 
+    # The WorkOrder for the plan actually approved — the cached proposal
+    # describes the recommended plan, which need not be this one. Minimal
+    # Intervention defers physical work, so its proposal carries none.
+    work_order = build_work_order(
+        plan,
+        field_requirements=[] if plan.get("deferred_work") else final.get("field_requirements", []),
+        resources=final.get("field_resources", {"repair_crews": 2, "signal_crews": 1}),
+    )
+
     # Register what this plan committed to, then re-grade against a FRESH
     # snapshot. Registering every action — not just the ones the apply loop
     # reported — is the point: an action that never landed must show as
-    # outstanding work, not vanish from the checklist.
+    # outstanding work, not vanish from the checklist. Field tasks become
+    # work items too, proved against the twin like everything else.
     post_snapshot, source = fetch_snapshot()
     with _ledger_lock:
-        _LEDGER.record_work_order(final.get("work_order", {}), post_snapshot)
+        _LEDGER.record_dispatch(target_id, plan["actions"], post_snapshot)
+        _LEDGER.record_work_order(work_order, post_snapshot)
         graded = _LEDGER.observe(post_snapshot)
+
+    # Closing a failed section is only the start of fixing it: hand the
+    # proposal's field work (crew, repair, signals) to the twin, which carries
+    # it out over ticks. Only the twin's own read-back ever marks it complete.
+    registered, problems = [], []
+    if apply_error is None:
+        registered, problems = _dispatch_field_work(plan, work_order, graded)
+        if registered:
+            final["log"].append({
+                "t": time.strftime("%H:%M:%S"),
+                "source": "Field",
+                "message": "Work order(s) registered on the twin: " + ", ".join(
+                    f"{o['id']} ({o['target']})" for o in registered),
+            })
+            with _ledger_lock:
+                for order in registered:
+                    _LEDGER.attach_work_order(order["id"], order.get("incident_id"))
+            post_snapshot, source = fetch_snapshot()
+            graded = _observe(post_snapshot)
+        elif plan.get("deferred_work"):
+            final["log"].append({
+                "t": time.strftime("%H:%M:%S"),
+                "source": "Field",
+                "message": (f"Plan {target_id} defers field work by doctrine: "
+                            + ", ".join(plan["deferred_work"])),
+            })
+        for problem in problems:
+            final["log"].append({
+                "t": time.strftime("%H:%M:%S"),
+                "source": "Field",
+                "message": f"Could not order field work — {problem}",
+            })
+    final["work_order"] = {
+        **work_order,
+        "status": ("DISPATCHED" if registered else
+                   "DEFERRED" if plan.get("deferred_work") else "NO_FIELD_WORK"),
+        "twin_orders": [o["id"] for o in registered],
+    }
     final["escalation"] = graded
     final["snapshot"] = post_snapshot
     worst = max(

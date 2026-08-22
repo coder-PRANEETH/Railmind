@@ -155,16 +155,23 @@ Every open incident reports one of four states, recomputed from the live twin on
 
 Each action an approved plan commits to becomes a **work item** (`DONE` / `PENDING` / `FAILED` / `BLOCKED`) that is re-verified against the twin on every observation. An apply that returned success but whose reroute never landed reads `PENDING`, and its incident stays `PARTIAL` — the console cannot report work it cannot prove.
 
+## Field work: work orders in the twin
+
+Physical interventions are not instantaneous either. A **work order** registered on the twin carries **field tasks** — `CLOSE_TRACK`, `DISPATCH_CREW`, `REPAIR_TRACK`, `RESTORE_SIGNAL`, `SPEED_RESTRICT`, `REROUTE_TRAIN` — that execute over simulation ticks, respect dependencies (the repair cannot start before the section is closed and the crew has arrived), and can be **blocked by the railway itself** (a storm keeps crews off the track). Assets pass through transitional states (`CLOSING`, `UNDER_REPAIR` with health climbing) that the console can show, and a task is `COMPLETED` only when the twin reads back the physical state that proves it — a repair that leaves the track critical is `UNRESOLVED`. Orders aggregate with the same vocabulary as the completion signal (`COMPLETE` / `PARTIAL` / `BLOCKED` / `UNRESOLVED`), expose progress, an ETA in ticks and an event log, and can be retried or cancelled. Executing a plan that closes a failed section orders that section's repair automatically; the escalation tracker shows each incident's field work, and the console's **Field Work** panel lets the operator retry, cancel, order a repair, or play the twin forward. See [docs/WORK_ORDERS.md](docs/WORK_ORDERS.md).
+
 ---
 
 ## Key API endpoints
 
 | Service | Endpoint | Purpose |
 |---|---|---|
-| Twin | `GET /api/state/` | Full network snapshot (tracks, trains, weather, graph) |
+| Twin | `GET /api/state/` | Full network snapshot (tracks, trains, weather, graph, work orders, crews) |
 | Twin | `POST /api/copy/` | Clone the twin into a sandbox "future" session |
 | Twin | `POST /api/track/close/` · `POST /api/route/find/` | Mutate / query the twin |
 | Twin | `POST /api/weather/set/` | Set weather on a track |
+| Twin | `GET` · `POST /api/workorders/` | List work orders / register one (template or explicit tasks) |
+| Twin | `GET /api/workorders/{id}/` · `POST …/retry/` · `POST …/cancel/` | Live status of one order; retry blocked tasks; cancel |
+| Twin | `POST /api/tick/` | Fast-forward the simulation by `n` ticks |
 | Twin | `POST /api/reset/` | Rebuild baseline twin between demos |
 | Agents | `GET /state` | Live twin snapshot (the console polls this — trains move each tick) |
 | Agents | `POST /run` | Run the full pipeline on the live twin |
@@ -176,6 +183,8 @@ Each action an approved plan commits to becomes a **work item** (`DONE` / `PENDI
 | Agents | `GET /escalation` | Handling level, owner, and the completion signal for every incident |
 | Agents | `POST /incidents/{id}/acknowledge` | Take ownership at the current tier and restart its dwell clock |
 | Agents | `POST /incidents/{id}/brief` | Draft the handoff brief for the receiving controller |
+| Agents | `GET /workorders` · `POST /workorders/incident-response/{track_id}` | Field work on the twin: list orders; order close → crew → repair on a failed section |
+| Agents | `POST /workorders/{id}/retry` · `POST /workorders/{id}/cancel` · `POST /workorders/tick?ticks=` | Retry blocked work, cancel an order, fast-forward the twin |
 
 ---
 
@@ -208,4 +217,4 @@ python -m pytest -q            # on Windows: PYTHONUTF8=1 python -m pytest -q
 cd railmind-projec && npm install && npm test
 ```
 
-The suite is hermetic — an exported `ANTHROPIC_API_KEY` is stripped so tests never call the real API. 123 backend tests and 19 console tests; CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/test/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.
+The suite is hermetic — an exported `ANTHROPIC_API_KEY` is stripped so tests never call the real API. 181 backend tests and 25 console tests; CI (GitHub Actions) runs the pytest suite, Django system checks, a core-engine smoke run, and the console typecheck/lint/test/build on every push. See [docs/PITCH.md](docs/PITCH.md) for the judge-facing overview.

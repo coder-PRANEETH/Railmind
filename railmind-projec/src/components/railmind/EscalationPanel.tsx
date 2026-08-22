@@ -358,6 +358,38 @@ function IncidentCard({
               ))}
             </ul>
           )}
+          {incident.field_work && (
+            <div className="mt-2">
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+                Field work
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+                <span className="font-mono-mc text-[10px] text-info">{incident.field_work.id}</span>
+                {incident.field_work.status === "CANCELLED" ? (
+                  <span className="font-mono-mc text-[10px] text-muted-foreground">CANCELLED</span>
+                ) : (
+                  <ResolutionChip resolution={incident.field_work.status} size="xs" />
+                )}
+                <span className="font-mono-mc text-[10px] text-muted-foreground">
+                  {incident.field_work.completion_percentage}%
+                  {incident.field_work.estimated_ticks_remaining > 0
+                    ? ` · ≈ ${incident.field_work.estimated_ticks_remaining} ticks left`
+                    : ""}
+                </span>
+              </div>
+              {incident.field_work.blocked_reason ? (
+                <div className="mt-0.5 text-[11px] text-danger">
+                  {incident.field_work.blocked_reason}
+                </div>
+              ) : (
+                incident.field_work.current && (
+                  <div className="mt-0.5 text-[11px] text-muted-foreground">
+                    {incident.field_work.current}
+                  </div>
+                )
+              )}
+            </div>
+          )}
         </div>
 
         <div>

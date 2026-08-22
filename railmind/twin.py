@@ -1,8 +1,25 @@
 import time
 import copy
 import random
-from .models import NetworkState, StationNode, TrackSegment, TrainState, TrackStatus, WeatherCondition
+from typing import Dict, List, Optional
+from .models import (
+    IMPASSABLE_TRACK_STATUSES,
+    NetworkState,
+    StationNode,
+    TrackSegment,
+    TrainState,
+    TrackStatus,
+    WeatherCondition,
+)
 from .graph import RailwayGraph
+from .work_orders import (
+    ENGINE_PARAMS,
+    ORDER_INPUT_FIELDS,
+    TASK_INPUT_FIELDS,
+    CrewUnit,
+    WorkOrder,
+)
+from . import execution
 
 class DigitalTwin:
     # One simulated minute counts as this many minutes of train movement,
@@ -45,10 +62,21 @@ class DigitalTwin:
         self._last_tick = time.time()
         # Manually injected weather is pinned: ambient decay must not clear it
         self._pinned_weather = set()
+        # Ambient weather rolls in at random each tick. Switch it off to
+        # replay a scenario where only operator-injected weather applies.
+        self.ambient_weather = True
+        # Execution layer: field work the twin is carrying out over ticks.
+        # Work orders and crews are ordinary twin state — copy() clones them,
+        # so a forecast clone plays the repair forward along with the trains.
+        self.sim_tick = 0
+        self.work_orders: Dict[str, WorkOrder] = {}
+        self.crews: Dict[str, CrewUnit] = {}
+        self._wo_seq = 0
+        self._crew_seq = 0
 
     def get_state(self):
         dump = self.state.model_dump()
-        
+
         for st in dump["stations"].values():
             st["active_signals"] = {k: v.value if hasattr(v, "value") else v for k, v in st["active_signals"].items()}
         for tr in dump["tracks"].values():
@@ -57,7 +85,10 @@ class DigitalTwin:
         for k, w in dump["weather"].items():
             if hasattr(w, "value"):
                 dump["weather"][k] = w.value
-                
+
+        dump["sim_tick"] = self.sim_tick
+        dump["work_orders"] = self.work_orders_payload()
+        dump["crews"] = {cid: crew.payload() for cid, crew in self.crews.items()}
         return dump
 
     def copy(self):
@@ -69,6 +100,19 @@ class DigitalTwin:
         self.state.tracks[track_id].status = TrackStatus.CLOSED
         self.state.tracks[track_id].health = 0.0
         self.graph.close_track(track_id)
+
+    def set_track_status(self, track_id, status, health=None):
+        """Set a track's physical status (and optionally health) on the state
+        and the routing graph together, so a train's held-check and the
+        route planner never disagree about a section."""
+        if track_id not in self.state.tracks:
+            raise ValueError(f"Unknown track id: {track_id}")
+        status = TrackStatus(status)
+        track = self.state.tracks[track_id]
+        track.status = status
+        if health is not None:
+            track.health = health
+        self.graph.set_track_status(track_id, status, health)
 
     def find_route(self, source, destination):
         return self.graph.find_route(source, destination)
@@ -253,8 +297,10 @@ class DigitalTwin:
 
     def tick(self, minutes: float = 2.0):
         """Advance the living twin one step: trains move along their routes,
-        congestion drifts, weather comes and goes. Closed tracks hold trains."""
+        congestion drifts, weather comes and goes, field work progresses.
+        Closed, closing and under-repair tracks hold trains."""
         rng = self._rng
+        self.sim_tick += 1
 
         for train in self.state.trains.values():
             # Every train draws its jitter each tick — held, turning around
@@ -275,7 +321,7 @@ class DigitalTwin:
 
             next_station = route[train.route_index + 1]
             track = self._track_between(train.current_station, next_station)
-            if track is None or track.status == TrackStatus.CLOSED:
+            if track is None or track.status in IMPASSABLE_TRACK_STATUSES:
                 train.held = True
                 train.delayed_minutes += minutes
                 continue
@@ -285,6 +331,8 @@ class DigitalTwin:
             # SIM_TIME_COMPRESSION squeezes real inter-city travel times into
             # demo pace (avg step per 2-min tick stays near the old 0.30).
             speed_kmh = min(train.speed_kmh, track.max_speed_kmh)
+            if track.speed_restriction_kmh is not None:
+                speed_kmh = min(speed_kmh, track.speed_restriction_kmh)
             if track.status == TrackStatus.DEGRADED:
                 speed_kmh *= 0.6
             step = (speed_kmh * (minutes * self.SIM_TIME_COMPRESSION) / 60.0) / max(track.length_km, 1.0)
@@ -301,7 +349,7 @@ class DigitalTwin:
         for st in self.state.stations.values():
             st.congestion_level = min(0.95, max(0.05, st.congestion_level + rng.uniform(-0.05, 0.05)))
 
-        track_ids = list(self.state.tracks.keys())
+        track_ids = list(self.state.tracks.keys()) if self.ambient_weather else []
         if track_ids and rng.random() < 0.12:
             tid = rng.choice(track_ids)
             # Never overwrite an operator-injected condition
@@ -313,6 +361,10 @@ class DigitalTwin:
         for tid in list(self.state.weather.keys()):
             if tid not in self._pinned_weather and rng.random() < 0.25:
                 del self.state.weather[tid]
+
+        # Field work runs after the railway has moved and the weather has
+        # settled, so a storm that began this tick blocks this tick's work.
+        execution.run_tick(self)
 
         self.state.timestamp = time.time()
 
@@ -327,6 +379,120 @@ class DigitalTwin:
         self._last_tick = time.time()
         return True
 
+    def advance_ticks(self, ticks: int):
+        """Fast-forward the simulation by a fixed number of ticks — lets the
+        backend (and tests) play field work forward without waiting on the
+        wall clock."""
+        ticks = int(ticks)
+        if ticks < 1:
+            raise ValueError("ticks must be at least 1")
+        for _ in range(ticks):
+            self.tick()
+        return self.sim_tick
+
+    # ------------------------------------------------------------------
+    # Work orders — the execution layer the backend talks to
+    # ------------------------------------------------------------------
+
+    def _next_work_order_id(self):
+        self._wo_seq += 1
+        return f"WO-{self._wo_seq:03d}"
+
+    def _next_crew_id(self):
+        self._crew_seq += 1
+        return f"CREW-{self._crew_seq:03d}"
+
+    def register_work_order(self, work_order):
+        """Register a WorkOrder (model or plain dict) for execution.
+
+        Missing work-order and task ids are assigned; every task target must
+        exist in the twin and the dependency graph must be acyclic. Tasks
+        start PENDING and the order reads UNRESOLVED until tick() moves it —
+        a caller cannot register work as already done, only describe it.
+        """
+        if isinstance(work_order, WorkOrder):
+            wo = work_order
+        else:
+            data = dict(work_order)
+            unknown = sorted(set(data) - ORDER_INPUT_FIELDS)
+            if unknown:
+                raise ValueError(f"Unsupported work order field(s): {unknown}")
+            if not data.get("id"):
+                data["id"] = self._next_work_order_id()
+            tasks = []
+            for i, task in enumerate(data.get("tasks") or [], start=1):
+                if not isinstance(task, dict):
+                    raise ValueError("Each task must be an object")
+                task = dict(task)
+                unknown = sorted(set(task) - TASK_INPUT_FIELDS)
+                if unknown:
+                    raise ValueError(f"Unsupported task field(s): {unknown}")
+                params = task.get("params")
+                if params is not None and not isinstance(params, dict):
+                    raise ValueError("Task params must be an object")
+                reserved = sorted(ENGINE_PARAMS & set(params or {}))
+                if reserved:
+                    raise ValueError(f"Task params {reserved} are set by the twin, not the caller")
+                if not task.get("id"):
+                    task["id"] = f"task_{i}"
+                tasks.append(task)
+            data["tasks"] = tasks
+            wo = WorkOrder.model_validate(data)
+
+        wo.assert_fresh()
+        if wo.id in self.work_orders:
+            raise ValueError(f"Duplicate work order id: {wo.id}")
+        execution.validate_work_order(self, wo)
+
+        wo.created_at = time.time()
+        wo.created_tick = self.sim_tick
+        wo.status = wo.recalculate_status()
+        wo.log(self.sim_tick, "registered", f"{len(wo.tasks)} task(s) registered")
+        self.work_orders[wo.id] = wo
+        return wo
+
+    def create_incident_response(self, track_id, incident_id=None, work_order_id=None):
+        """Register the standard close -> dispatch crew -> repair order for a
+        failed section."""
+        if track_id not in self.state.tracks:
+            raise ValueError(f"Unknown track id: {track_id}")
+        wo = execution.build_incident_response(self, track_id, incident_id, work_order_id)
+        return self.register_work_order(wo)
+
+    def get_work_order(self, work_order_id) -> WorkOrder:
+        if work_order_id not in self.work_orders:
+            raise KeyError(work_order_id)
+        return self.work_orders[work_order_id]
+
+    def work_order_payload(self, work_order_id):
+        return self.get_work_order(work_order_id).payload()
+
+    def work_orders_payload(self) -> List[dict]:
+        return [wo.payload() for wo in self.work_orders.values()]
+
+    def cancel_work_order(self, work_order_id, reason="Cancelled by operator"):
+        wo = self.get_work_order(work_order_id)
+        if wo.cancelled:
+            raise ValueError(f"Work order {work_order_id} is already cancelled")
+        execution.cancel(self, wo, reason)
+        return wo
+
+    def retry_task(self, work_order_id, task_id: Optional[str] = None):
+        """Move BLOCKED tasks back to PENDING — one task, or every blocked
+        task in the order when task_id is omitted."""
+        wo = self.get_work_order(work_order_id)
+        if wo.cancelled:
+            raise ValueError(f"Work order {work_order_id} is cancelled")
+        if task_id is None:
+            task_ids = [t.id for t in wo.tasks if t.status.value == "BLOCKED"]
+        else:
+            try:
+                wo.task(task_id)
+            except KeyError:
+                raise ValueError(f"Unknown task {task_id} in work order {work_order_id}")
+            task_ids = [task_id]
+        return execution.retry(self, wo, task_ids)
+
     def calculate_delay(self):
         total = 0.0
         for tr in self.state.trains.values():
@@ -340,9 +506,9 @@ class DigitalTwin:
         total = 0.0
         for tr in self.state.tracks.values():
             w = 0.5
-            if tr.status == TrackStatus.CLOSED:
+            if tr.status in (TrackStatus.CLOSED, TrackStatus.CLOSING):
                 w = 2.0
-            elif tr.status == TrackStatus.DEGRADED:
+            elif tr.status in (TrackStatus.DEGRADED, TrackStatus.UNDER_REPAIR):
                 w = 1.5
             risk = (1.0 - tr.health) * w
             

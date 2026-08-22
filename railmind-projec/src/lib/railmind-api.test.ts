@@ -1,14 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  advanceTwin,
   buildMockBrief,
   buildMockEscalation,
   buildMockRun,
   buildMockWeatherRun,
+  cancelWorkOrder,
+  dispatchFieldWork,
   fetchEscalation,
+  fetchWorkOrders,
   isValidRunResponse,
   normalize,
+  retryWorkOrder,
   runSimulation,
   type RunResponse,
+  type WorkOrder,
 } from "./railmind-api";
 
 afterEach(() => {
@@ -186,5 +192,110 @@ describe("buildMockBrief", () => {
   it("asks for stand-down once the work is verified", () => {
     const incident = buildMockEscalation(buildMockRun("T23"), true).incidents[0];
     expect(buildMockBrief(incident).text).toContain("confirm stand-down");
+  });
+});
+
+const ORDER: WorkOrder = {
+  id: "WO-001",
+  incident_id: "INC-001",
+  type: "CRITICAL_INCIDENT_RESPONSE",
+  target: "T23",
+  status: "BLOCKED",
+  completion_percentage: 33,
+  estimated_ticks_remaining: 29,
+  created_tick: 0,
+  cancelled: false,
+  cancel_reason: null,
+  auto_retry: false,
+  tasks: [
+    {
+      id: "task_1",
+      action: "CLOSE_TRACK",
+      target: "T23",
+      status: "COMPLETED",
+      ticks_required: 1,
+      ticks_remaining: 0,
+      progress: 1,
+      depends_on: [],
+      blocking_reason: null,
+      detail: "T23 is closed to traffic",
+      started_tick: 1,
+      completed_tick: 1,
+    },
+    {
+      id: "task_2",
+      action: "DISPATCH_CREW",
+      target: "T23",
+      status: "BLOCKED",
+      ticks_required: 10,
+      ticks_remaining: 10,
+      progress: 0,
+      depends_on: ["task_1"],
+      blocking_reason: "Severe storm prevents crew access to T23",
+      detail: "Blocked: Severe storm prevents crew access to T23",
+      started_tick: null,
+      completed_tick: null,
+    },
+  ],
+  events: [{ tick: 1, kind: "blocked", task_id: "task_2", detail: "Severe storm" }],
+};
+
+describe("fetchWorkOrders", () => {
+  it("returns the twin's orders when the payload is well-formed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ twin_source: "embedded", work_orders: [ORDER] }),
+      }),
+    );
+    await expect(fetchWorkOrders()).resolves.toEqual([ORDER]);
+  });
+
+  it("returns null rather than half an order when the shape is wrong", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ work_orders: [{ id: 1 }] }) }),
+    );
+    await expect(fetchWorkOrders()).resolves.toBeNull();
+  });
+
+  it("returns null when the backend is unreachable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
+    await expect(fetchWorkOrders()).resolves.toBeNull();
+  });
+});
+
+describe("field work verbs", () => {
+  it("retry posts to the agent service and returns the twin's order", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: "success", work_order: { ...ORDER, status: "PARTIAL" } }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const order = await retryWorkOrder("WO-001", "task_2");
+    expect(order?.status).toBe("PARTIAL");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/workorders/WO-001/retry?task_id=task_2"),
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("cancel and dispatch read the twin's refusal as null", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 409 }));
+    await expect(cancelWorkOrder("WO-001")).resolves.toBeNull();
+    await expect(dispatchFieldWork("T23")).resolves.toBeNull();
+  });
+
+  it("advanceTwin reports whether the twin accepted the fast-forward", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(advanceTwin(5)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/workorders/tick?ticks=5"),
+      expect.objectContaining({ method: "POST" }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
+    await expect(advanceTwin(5)).resolves.toBe(false);
   });
 });

@@ -43,12 +43,16 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { NetworkMap } from "./NetworkMap";
 import { TrainsPanel, getTrainRoute } from "./TrainsPanel";
 import { EscalationRail, IncidentTracker } from "./EscalationPanel";
+import { FieldWorkPanel } from "./FieldWorkPanel";
 import { TRACKS, TRAINS, stationName, type Train as TrainType } from "@/lib/railmind-data";
 import {
   acknowledgeIncident,
+  advanceTwin,
   applyPlan,
   buildMockBrief,
   buildMockEscalation,
+  cancelWorkOrder,
+  dispatchFieldWork,
   draftBrief,
   fetchEscalation,
   fetchLiveState,
@@ -56,6 +60,7 @@ import {
   injectTrackFailure,
   injectWeather,
   resetTwin,
+  retryWorkOrder,
   runSimulation,
   runSimulationStream,
   STEADY_STATE,
@@ -293,6 +298,48 @@ export function Dashboard() {
     setEscalationOffline(true);
   }, []);
 
+  // ── Field work: every verb is carried out by the twin; after one lands,
+  // re-read both the fleet (orders ride on /state) and the ledger.
+  const afterFieldWork = useCallback(async () => {
+    await Promise.all([refreshLive(), refreshEscalation()]);
+  }, [refreshLive, refreshEscalation]);
+
+  const onRetryWorkOrder = useCallback(
+    async (id: string) => {
+      const order = await retryWorkOrder(id);
+      if (order) await afterFieldWork();
+      return order;
+    },
+    [afterFieldWork],
+  );
+
+  const onCancelWorkOrder = useCallback(
+    async (id: string) => {
+      const order = await cancelWorkOrder(id);
+      if (order) await afterFieldWork();
+      return order;
+    },
+    [afterFieldWork],
+  );
+
+  const onAdvanceTwin = useCallback(
+    async (ticks: number) => {
+      const ok = await advanceTwin(ticks);
+      if (ok) await afterFieldWork();
+      return ok;
+    },
+    [afterFieldWork],
+  );
+
+  const onDispatchFieldWork = useCallback(
+    async (track: string) => {
+      const order = await dispatchFieldWork(track);
+      if (order) await afterFieldWork();
+      return order;
+    },
+    [afterFieldWork],
+  );
+
   const onBrief = useCallback(
     async (incidentId: string): Promise<HandoffBrief | null> => {
       const real = await draftBrief(incidentId);
@@ -502,9 +549,17 @@ export function Dashboard() {
   const trains = live?.trains ?? (dataTrainsAreLive && data?.trains ? data.trains : offlineTrains);
   const twinSource = live?.twin_source ?? data?.twin_source;
 
-  // Map layers: live closed tracks + selected-plan preview override
+  // Map layers: live impassable tracks + selected-plan preview override.
+  // CLOSING / UNDER_REPAIR are the twin's work-order states; it holds
+  // traffic at them exactly like CLOSED (mirrors IMPASSABLE_STATUSES in
+  // agents/escalation.py).
   const liveClosed = useMemo(
-    () => (live ? live.tracks.filter((t) => t.status === "CLOSED").map((t) => t.id) : []),
+    () =>
+      live
+        ? live.tracks
+            .filter((t) => ["CLOSED", "CLOSING", "UNDER_REPAIR"].includes(t.status))
+            .map((t) => t.id)
+        : [],
     [live],
   );
   const previewPlan = selectedPlan != null ? plans.find((p) => p.id === selectedPlan) : undefined;
@@ -992,6 +1047,20 @@ export function Dashboard() {
           onAcknowledge={onAcknowledge}
           onBrief={onBrief}
           busy={loading}
+        />
+
+        {/* Field work — the twin's work orders and crews, proved tick by tick */}
+        <FieldWorkPanel
+          workOrders={live?.work_orders ?? []}
+          crews={live?.crews ?? {}}
+          simTick={live?.sim_tick ?? null}
+          offline={!live}
+          busy={loading}
+          dispatchTarget={trackId}
+          onRetry={onRetryWorkOrder}
+          onCancel={onCancelWorkOrder}
+          onAdvance={onAdvanceTwin}
+          onDispatch={onDispatchFieldWork}
         />
 
         {/* Timeline */}

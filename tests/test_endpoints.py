@@ -159,3 +159,118 @@ def test_reset_clears_the_ledger(client):
     after = client.get("/escalation").json()
     assert after["totals"]["open"] == 0
     assert after["incidents"] == []
+
+
+# ── work orders (field work on the twin) ────────────────────────────────────
+
+def _quiet_twin():
+    # Exact task states below must not be disturbed by a random storm
+    all_agent._get_embedded_twin().ambient_weather = False
+
+
+def test_apply_plan_orders_field_work_for_the_sections_it_closes(client):
+    client.post("/simulate-track-failure/T23")
+    _quiet_twin()
+    body = client.post("/apply-plan", params={"plan_id": "A"}).json()
+    # The closure landed immediately; the field work went to the twin
+    assert any("Closed track T23" in a for a in body["applied_actions"])
+    proposal = body["work_order"]
+    assert proposal["status"] == "DISPATCHED"
+    assert proposal["twin_orders"] == [proposal["work_order_id"]]
+    assert any(e["source"] == "Field" and f"{proposal['work_order_id']} (T23)" in e["message"]
+               for e in body["execution_log"])
+
+    orders = client.get("/workorders").json()["work_orders"]
+    assert [o["target"] for o in orders] == ["T23"]
+    order = orders[0]
+    assert order["id"] == proposal["work_order_id"]
+    assert order["incident_id"] == "INC-001"
+    assert order["type"] == "CRITICAL_INCIDENT_RESPONSE"
+    # Only the specialists' field requirements become twin tasks — the
+    # closure was an operational action, already carried out
+    assert [t["action"] for t in order["tasks"]] == ["DISPATCH_CREW", "REPAIR_TRACK"]
+    assert order["tasks"][1]["depends_on"] == [order["tasks"][0]["id"]]
+
+    # The escalation view carries the field work and the ledger's work items
+    incident = body["escalation"]["incidents"][0]
+    assert incident["work_order_id"] == order["id"]
+    assert incident["field_work"]["id"] == order["id"]
+    assert incident["field_work"]["status"] == "UNRESOLVED"
+    kinds = {w["kind"]: w["state"] for w in incident["work_items"]}
+    assert kinds["close_track"] == "DONE"
+    assert kinds["dispatch_crew"] == "PENDING"     # proved by a crew on site, not by acceptance
+    assert kinds["repair_track"] == "PENDING"
+    assert incident["resolution"] != "COMPLETE"
+
+    # Applying the plan again does not stack a second order on the section
+    client.post("/apply-plan", params={"plan_id": "A"})
+    assert len(client.get("/workorders").json()["work_orders"]) == 1
+
+    # Play the field work out: the repair lands and the incident completes
+    res = client.post("/workorders/tick", params={"ticks": 31}).json()
+    assert res["work_orders"][0]["status"] == "COMPLETE"
+    state = client.get("/state").json()
+    assert next(t for t in state["tracks"] if t["id"] == "T23")["status"] == "OPEN"
+    incident = client.get("/escalation").json()["incidents"][0]
+    kinds = {w["kind"]: w["state"] for w in incident["work_items"]}
+    assert kinds["dispatch_crew"] == "DONE" and kinds["repair_track"] == "DONE"
+
+
+def test_minimal_intervention_defers_field_work(client):
+    client.post("/simulate-track-failure/T23")
+    _quiet_twin()
+    body = client.post("/apply-plan", params={"plan_id": "C"}).json()
+    assert body["work_order"]["status"] == "DEFERRED"
+    assert body["work_order"]["twin_orders"] == []
+    assert any(e["source"] == "Field" and "defers field work" in e["message"]
+               for e in body["execution_log"])
+    assert client.get("/workorders").json()["work_orders"] == []
+
+
+def test_work_order_verbs_are_carried_out_by_the_twin(client):
+    client.post("/simulate-track-failure/T23")
+    _quiet_twin()
+    client.post("/simulate-weather/T23", params={"condition": "STORM"})
+    res = client.post("/workorders/incident-response/T23")
+    assert res.status_code == 200
+    wo = res.json()["work_order"]
+    assert wo["status"] == "UNRESOLVED" and wo["incident_id"] == "INC-001"
+    assert client.post("/workorders/incident-response/T23").status_code == 409
+
+    res = client.post("/workorders/tick", params={"ticks": 1}).json()
+    order = res["work_orders"][0]
+    assert order["status"] == "BLOCKED"
+    assert order["tasks"][1]["blocking_reason"] == "Severe storm prevents crew access to T23"
+    field_work = res["escalation"]["incidents"][0]["field_work"]
+    assert field_work["status"] == "BLOCKED"
+    assert field_work["blocked_reason"] == "Severe storm prevents crew access to T23"
+
+    client.post("/simulate-weather/T23", params={"condition": "CLEAR"})
+    res = client.post(f"/workorders/{wo['id']}/retry")
+    assert res.status_code == 200
+    assert res.json()["work_order"]["status"] == "PARTIAL"
+    res = client.post(f"/workorders/{wo['id']}/retry")
+    assert res.status_code == 200 and res.json()["work_order"]["status"] == "PARTIAL"
+
+    res = client.post(f"/workorders/{wo['id']}/cancel", params={"reason": "Stood down"})
+    assert res.status_code == 200
+    assert res.json()["work_order"]["status"] == "CANCELLED"
+    assert res.json()["work_order"]["cancel_reason"] == "Stood down"
+    assert client.post(f"/workorders/{wo['id']}/cancel").status_code == 400
+
+    assert client.post("/workorders/WO-404/retry").status_code == 404
+    assert client.post("/workorders/WO-404/cancel").status_code == 404
+    assert client.post("/workorders/tick", params={"ticks": 0}).status_code == 400
+    assert client.post("/workorders/incident-response/NOPE").status_code == 404
+
+
+def test_state_carries_field_work_and_reset_clears_it(client):
+    client.post("/simulate-track-failure/T23")
+    client.post("/workorders/incident-response/T23")
+    state = client.get("/state").json()
+    assert state["work_orders"][0]["target"] == "T23"
+    assert isinstance(state["sim_tick"], int)
+    assert state["crews"] == {}
+    client.post("/reset")
+    assert client.get("/workorders").json()["work_orders"] == []
+    assert client.get("/state").json()["work_orders"] == []

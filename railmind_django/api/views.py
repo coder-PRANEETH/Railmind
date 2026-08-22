@@ -8,6 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
+from drf_spectacular.utils import extend_schema
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
@@ -39,6 +40,15 @@ def _build_default_twin():
 
 def _session_id(request):
     return request.headers.get("X-Session-ID", "default")
+
+
+def _json_object(request):
+    """The request body as a dict, or an error response if it is not one
+    (DRF hands a JSON array/string/number through as-is)."""
+    body = request.data
+    if isinstance(body, dict):
+        return body, None
+    return None, Response({"error": "Request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 def _resolve_twin(session_id):
@@ -104,7 +114,10 @@ def get_state(request):
         "tracks": state_dump.get("tracks", {}),
         "trains": state_dump.get("trains", {}),
         "stations": state_dump.get("stations", {}),
-        "graph": graph_state
+        "graph": graph_state,
+        "sim_tick": state_dump.get("sim_tick", 0),
+        "work_orders": state_dump.get("work_orders", []),
+        "crews": state_dump.get("crews", {}),
     })
 
 
@@ -390,3 +403,221 @@ def calculate_risk(request):
 
         risk = twin.calculate_risk()
     return Response({"risk_score": risk})
+
+
+# Upper bound on ticks one /api/tick/ call may play forward; keeps a single
+# request from holding the twin lock for long.
+MAX_TICKS_PER_REQUEST = 200
+
+WORK_ORDER_TEMPLATES = ("CRITICAL_INCIDENT_RESPONSE", "TRACK_REPAIR")
+
+
+@api_view(['POST'])
+def advance_twin(request):
+    """
+    Fast-forward the simulation by a number of ticks.
+
+    Field work (work orders) only progresses as simulation time passes;
+    this lets the console or an operator play it forward on demand instead
+    of waiting on the wall clock behind /api/state/.
+
+    Example usage:
+    ```json
+    {"ticks": 5}
+    ```
+    """
+    body, error = _json_object(request)
+    if error:
+        return error
+    ticks = body.get("ticks", 1)
+    if isinstance(ticks, bool) or not isinstance(ticks, int):
+        return Response({"error": "ticks must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+    if ticks < 1 or ticks > MAX_TICKS_PER_REQUEST:
+        return Response(
+            {"error": f"ticks must be between 1 and {MAX_TICKS_PER_REQUEST}"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
+        sim_tick = twin.advance_ticks(ticks)
+        work_orders = twin.work_orders_payload()
+    return Response({"status": "success", "ticks": ticks, "sim_tick": sim_tick, "work_orders": work_orders})
+
+
+@extend_schema(methods=["GET"], operation_id="workorders_list")
+@extend_schema(methods=["POST"], operation_id="workorders_create")
+@api_view(['GET', 'POST'])
+def work_orders(request):
+    """
+    List the twin's work orders, or register a new one.
+
+    A work order is executed by the twin over simulation ticks; its status
+    (UNRESOLVED / PARTIAL / BLOCKED / COMPLETE / CANCELLED) is derived from
+    the physical state the tasks actually reach, never from this request
+    succeeding.
+
+    POST either a template:
+    ```json
+    {"template": "CRITICAL_INCIDENT_RESPONSE", "track_id": "T23", "incident_id": "INC-001"}
+    ```
+    or an explicit order:
+    ```json
+    {"incident_id": "INC-001", "target": "T23",
+     "tasks": [
+       {"id": "task_1", "action": "CLOSE_TRACK", "target": "T23", "ticks_required": 1},
+       {"id": "task_2", "action": "DISPATCH_CREW", "target": "T23", "ticks_required": 10,
+        "depends_on": ["task_1"]},
+       {"id": "task_3", "action": "REPAIR_TRACK", "target": "T23", "ticks_required": 20,
+        "depends_on": ["task_1", "task_2"]}
+     ]}
+    ```
+    Actions: CLOSE_TRACK, REROUTE_TRAIN, SPEED_RESTRICT, DISPATCH_CREW,
+    REPAIR_TRACK, RESTORE_SIGNAL. Optional per-task `params`: `route` /
+    `destination` (REROUTE_TRAIN), `speed_kmh` (SPEED_RESTRICT),
+    `restored_health` (REPAIR_TRACK). Optional `auto_retry` on the order.
+    """
+    if request.method == 'GET':
+        with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+            payload = twin.work_orders_payload()
+            sim_tick = twin.sim_tick
+        return Response({"sim_tick": sim_tick, "work_orders": payload})
+
+    body, error = _json_object(request)
+    if error:
+        return error
+
+    template = body.get("template")
+    if template is not None:
+        if template not in WORK_ORDER_TEMPLATES:
+            return Response(
+                {"error": f"Unknown template '{template}'; expected one of {list(WORK_ORDER_TEMPLATES)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        track_id = body.get("track_id") or body.get("target")
+        if not track_id or not isinstance(track_id, str):
+            return Response({"error": "Missing track_id"}, status=status.HTTP_400_BAD_REQUEST)
+    else:
+        target = body.get("target")
+        if not target or not isinstance(target, str):
+            return Response({"error": "Missing target"}, status=status.HTTP_400_BAD_REQUEST)
+        tasks = body.get("tasks")
+        if not isinstance(tasks, list) or not tasks or not all(isinstance(t, dict) for t in tasks):
+            return Response(
+                {"error": "tasks must be a non-empty list of task objects"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    incident_id = body.get("incident_id")
+    if incident_id is not None and not isinstance(incident_id, str):
+        return Response({"error": "incident_id must be a string"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        with _twin_lock:
+            twin = _resolve_twin(_session_id(request))
+            if not twin:
+                return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+
+            if template is not None:
+                if track_id not in twin.state.tracks:
+                    return Response({"error": f"Track '{track_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+                wo = twin.create_incident_response(
+                    track_id, incident_id=incident_id, work_order_id=body.get("id") or None
+                )
+            else:
+                wo = twin.register_work_order({
+                    "id": body.get("id") or None,
+                    "incident_id": incident_id,
+                    "type": body.get("type") or "CRITICAL_INCIDENT_RESPONSE",
+                    "target": target,
+                    "tasks": tasks,
+                    "auto_retry": bool(body.get("auto_retry", False)),
+                })
+            payload = wo.payload()
+    except ValueError as e:
+        # Covers pydantic validation errors too (a ValueError subclass)
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({"status": "success", "work_order": payload}, status=status.HTTP_201_CREATED)
+
+
+@extend_schema(operation_id="workorders_detail")
+@api_view(['GET'])
+def work_order_detail(request, work_order_id):
+    """
+    What is happening to one work order right now: its aggregate status,
+    completion percentage, ETA in ticks, every task with its progress and
+    blocking reason, and the most recent execution events.
+    """
+    with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            payload = twin.work_order_payload(work_order_id)
+        except KeyError:
+            return Response({"error": f"Work order '{work_order_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+        sim_tick = twin.sim_tick
+    return Response({"sim_tick": sim_tick, "work_order": payload})
+
+
+@api_view(['POST'])
+def work_order_cancel(request, work_order_id):
+    """
+    Cancel a work order. Tasks in flight are aborted and the assets they
+    were working on are put back (a CLOSING track reopens, a crew en route
+    is recalled); finished work stays as it is.
+    """
+    body, error = _json_object(request)
+    if error:
+        return error
+    reason = body.get("reason", "Cancelled by operator")
+    if not isinstance(reason, str) or not reason.strip():
+        return Response({"error": "reason must be a non-empty string"}, status=status.HTTP_400_BAD_REQUEST)
+
+    with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            wo = twin.cancel_work_order(work_order_id, reason=reason.strip())
+        except KeyError:
+            return Response({"error": f"Work order '{work_order_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        payload = wo.payload()
+    return Response({"status": "success", "work_order": payload})
+
+
+@api_view(['POST'])
+def work_order_retry(request, work_order_id):
+    """
+    Move BLOCKED tasks back to PENDING so the twin re-evaluates them on the
+    next tick. Pass `task_id` to retry one task, or omit it to retry every
+    blocked task in the order.
+    """
+    body, error = _json_object(request)
+    if error:
+        return error
+    task_id = body.get("task_id")
+    if task_id is not None and not isinstance(task_id, str):
+        return Response({"error": "task_id must be a string"}, status=status.HTTP_400_BAD_REQUEST)
+
+    with _twin_lock:
+        twin = _resolve_twin(_session_id(request))
+        if not twin:
+            return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            retried = twin.retry_task(work_order_id, task_id)
+            payload = twin.work_order_payload(work_order_id)
+        except KeyError:
+            return Response({"error": f"Work order '{work_order_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response({"status": "success", "retried": retried, "work_order": payload})

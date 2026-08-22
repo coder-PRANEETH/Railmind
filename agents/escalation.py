@@ -93,9 +93,17 @@ def _condition(value) -> str:
     return (value.value if hasattr(value, "value") else str(value)).upper()
 
 
+# Track statuses the twin holds traffic at. CLOSING and UNDER_REPAIR are the
+# twin's transitional work-order states: a section being rebuilt reads as
+# blocking even as its health climbs, so the ledger cannot call an incident
+# COMPLETE before the twin has actually reopened the corridor.
+IMPASSABLE_STATUSES = ("CLOSED", "CLOSING", "UNDER_REPAIR")
+
+
 def is_blocking(track: dict) -> bool:
-    """A corridor traffic cannot cross: closed by an operator, or failed outright."""
-    return track.get("status") == "CLOSED" or track.get("health", 1.0) <= 0.2
+    """A corridor traffic cannot cross: closed by an operator, being worked
+    on by a crew, or failed outright."""
+    return track.get("status") in IMPASSABLE_STATUSES or track.get("health", 1.0) <= 0.2
 
 
 def blocked_edges(snapshot: dict) -> set:
@@ -141,6 +149,39 @@ def severed_pairs(graph: nx.Graph) -> int:
     total = graph.number_of_nodes()
     reachable = sum(len(c) * (len(c) - 1) // 2 for c in nx.connected_components(graph))
     return total * (total - 1) // 2 - reachable
+
+
+# Health at which the twin calls a rebuilt section operational (mirrors
+# railmind/execution.py REPAIR_ACCEPTANCE_HEALTH; the ledger imports nothing).
+REPAIR_ACCEPTANCE_HEALTH = 0.4
+
+
+def _signals_green(track_id: str, snapshot: dict) -> bool:
+    """Both end signals of a section show GREEN on the twin."""
+    track = snapshot.get("tracks", {}).get(track_id) or {}
+    stations = snapshot.get("stations") or {}
+    ends = [s for s in (track.get("source"), track.get("destination")) if s in stations]
+    if not ends:
+        return _condition(snapshot.get("signals", {}).get(track_id, "")) == "GREEN"
+    return all(
+        _condition((stations[s].get("active_signals") or {}).get(track_id, "")) == "GREEN"
+        for s in ends
+    )
+
+
+def _crew_on_site(track_id: str, snapshot: dict) -> bool:
+    crews = snapshot.get("crews") or {}
+    if any(isinstance(c, dict) and c.get("target") == track_id and c.get("status") == "ON_SITE"
+           for c in crews.values()):
+        return True
+    # Crews stand down once their order ends; the twin's completed dispatch
+    # task is the record that they were there.
+    for order in snapshot.get("work_orders") or []:
+        for task in (order.get("tasks") or []) if isinstance(order, dict) else []:
+            if (isinstance(task, dict) and task.get("action") == "DISPATCH_CREW"
+                    and task.get("target") == track_id and task.get("status") == "COMPLETED"):
+                return True
+    return False
 
 
 def _path_exists(graph: nx.Graph, train: dict, route: Sequence[str]) -> bool:
@@ -207,6 +248,11 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
             settle(WORK_FAILED, f"Track {item.target} is no longer present in the twin.")
         elif is_blocking(track):
             settle(WORK_DONE, f"Track {item.target} confirmed out of service on the twin.")
+        elif item.completed_at is not None:
+            # The closure was proved earlier and the twin has since restored
+            # the corridor (a repair work order reopened it). Restoration is
+            # the outcome the closure was for, not evidence it never happened.
+            settle(WORK_DONE, f"Track {item.target} closure lifted after restoration.")
         else:
             settle(WORK_PENDING, f"Track {item.target} is still carrying traffic.")
         return
@@ -234,24 +280,28 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
         track = tracks.get(item.target)
         if track is None:
             settle(WORK_FAILED, f"Track {item.target} is no longer present in the twin.")
-        elif track.get("status") == "OPEN" and track.get("health", 0.0) >= 0.99:
-            settle(WORK_DONE, f"Track {item.target} repair verified on the twin.")
+        elif track.get("status") == "OPEN" and track.get("health", 0.0) >= REPAIR_ACCEPTANCE_HEALTH:
+            # The twin's own acceptance criterion for a rebuilt section
+            settle(WORK_DONE, f"Track {item.target} repair verified on the twin "
+                              f"(health {track.get('health', 0.0):.2f}).")
         else:
             settle(WORK_PENDING, f"Track {item.target} repair is not yet verified.")
         return
 
     if item.kind == "restore_signal":
-        signal = snapshot.get("signals", {}).get(item.target)
-        if signal == "GREEN":
-            settle(WORK_DONE, f"Signal {item.target} restoration verified on the twin.")
+        if _signals_green(item.target, snapshot):
+            settle(WORK_DONE, f"Signals on {item.target} verified GREEN on the twin.")
         else:
-            settle(WORK_PENDING, f"Signal {item.target} is not yet restored.")
+            settle(WORK_PENDING, f"Signals on {item.target} are not yet restored.")
         return
 
     if item.kind == "dispatch_crew":
-        # Dispatch acceptance is a backend commitment; the repair item is what
-        # proves the physical work actually completed.
-        settle(WORK_DONE, f"Crew dispatch for {item.target} accepted.")
+        # A dispatch is proved by a crew on the section, or by the twin
+        # having completed the dispatch task — never by its acceptance.
+        if _crew_on_site(item.target, snapshot):
+            settle(WORK_DONE, f"Crew on site at {item.target}.")
+        else:
+            settle(WORK_PENDING, f"Crew for {item.target} is not yet on site.")
         return
 
     if item.kind == "hold":
@@ -260,11 +310,68 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
             settle(WORK_FAILED, f"Train {item.target} is no longer present in the twin.")
         elif train.get("held"):
             settle(WORK_DONE, f"{item.target} is held short of the failed section.")
+        elif item.completed_at is not None and not route_crosses(
+                train.get("route", []), blocked_edges(snapshot)):
+            # The hold was proved earlier and the corridor has since been
+            # restored: the train is moving again on a clear route, which
+            # is what the hold was protecting it for.
+            settle(WORK_DONE, f"{item.target} released after restoration.")
         else:
             settle(WORK_PENDING, f"{item.target} has not been brought to a stand.")
         return
 
     settle(item.state, item.detail)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIELD WORK
+# The twin reports its work orders inside the snapshot. The one answering an
+# incident's corridor is summarised onto the incident so the console and the
+# handoff brief can say what is physically happening — without the ledger
+# performing any I/O of its own.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FIELD_WORK_LIVE = ("UNRESOLVED", "PARTIAL", "BLOCKED")
+
+
+def field_work_for(incident, work_orders: Sequence[dict]) -> Optional[dict]:
+    """Summarise the work order serving this incident, preferring a live one.
+
+    An order matches by incident id, or by targeting the incident's track
+    (orders registered before the ledger opened the incident carry no id)."""
+    matches = [
+        o for o in work_orders
+        if isinstance(o, dict) and (
+            o.get("incident_id") == incident.incident_id or o.get("target") == incident.track_id
+        )
+    ]
+    if not matches:
+        return None
+    live = [o for o in matches if o.get("status") in FIELD_WORK_LIVE]
+    order = live[-1] if live else matches[-1]
+    tasks = [t for t in (order.get("tasks") or []) if isinstance(t, dict)]
+    blocked = next((t for t in tasks if t.get("status") == "BLOCKED"), None)
+    running = next((t for t in tasks if t.get("status") == "IN_PROGRESS"), None)
+    return {
+        "id": order.get("id"),
+        "status": order.get("status"),
+        "completion_percentage": order.get("completion_percentage", 0),
+        "estimated_ticks_remaining": order.get("estimated_ticks_remaining", 0),
+        "blocked_reason": blocked.get("blocking_reason") if blocked else None,
+        "current": running.get("detail") if running else None,
+        "tasks": [
+            {
+                "id": t.get("id"),
+                "action": t.get("action"),
+                "status": t.get("status"),
+                "progress": t.get("progress", 0.0),
+                "ticks_remaining": t.get("ticks_remaining"),
+                "blocking_reason": t.get("blocking_reason"),
+                "detail": t.get("detail"),
+            }
+            for t in tasks
+        ],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +419,10 @@ class Incident:
     dispositions: Dict[str, str] = field(default_factory=dict)
     drivers: List[dict] = field(default_factory=list)
     work_order_id: Optional[str] = None
+    # The twin's work order for this corridor, when one exists — field work
+    # in progress is context for the controller, not a completion signal:
+    # the signal still comes from trains and proved actions alone.
+    field_work: Optional[dict] = None
 
     def move_to(self, level: int, reason: str, now: float) -> None:
         if level == self.level:
@@ -514,9 +625,11 @@ class IncidentLedger:
         for item in self._items.values():
             verify_work_item(item, snapshot, graph, now)
 
+        work_orders = snapshot.get("work_orders") or []
         for incident in self._incidents.values():
             if incident.closed:
                 continue
+            incident.field_work = field_work_for(incident, work_orders)
             incident.dispositions = self._dispositions(incident, trains, blocked, graph)
             items = self.items_for(incident.incident_id)
             cleared = self._condition_cleared(incident, tracks, weather)
@@ -708,6 +821,11 @@ class IncidentLedger:
         if existing is not None:
             existing.plan_id = plan_id
             existing.dispatched_at = now
+            # A fresh commitment has to be proved again; an earlier
+            # verification does not carry over to the new dispatch.
+            existing.state = WORK_PENDING
+            existing.detail = "Not yet executed."
+            existing.completed_at = None
             if existing.incident_id is None:
                 existing.incident_id = self._attribute(kind, target, old_route, snapshot)
             return existing
@@ -867,6 +985,7 @@ class IncidentLedger:
                 "actions_total": len(items),
             },
             "drivers": incident.drivers,
+            "field_work": incident.field_work,
             "work_items": [i.payload() for i in items],
             "events": [e.payload() for e in incident.events][-12:],
         }
