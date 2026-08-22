@@ -1,15 +1,30 @@
-from models import ScenarioScore, SimulationResult
-from twin import DigitalTwin
+import random
+
+from .models import ScenarioScore, SimulationResult
+from .twin import DigitalTwin
+
+# How far each scenario's cloned twin is advanced before scoring, and the
+# fixed seed for its RNG — both pinned so repeated runs agree exactly.
+FORECAST_TICKS = 10
+FORECAST_SEED = 2027
 
 class FutureTimelineSimulator:
     def __init__(self, twin: DigitalTwin):
         self.base_twin = twin
 
-    def generate_scenario(self, scenario_id, actions):
+    def generate_scenario(self, scenario_id, actions, ticks: int = FORECAST_TICKS):
         future = self.base_twin.copy()
+        # Reseed the clone so forecasts are deterministic regardless of how
+        # far the live twin's RNG has advanced.
+        future._rng = random.Random(FORECAST_SEED)
         for action in actions:
             future.apply_action(action)
-            
+
+        # Advance the future timeline: held trains at closed tracks accumulate
+        # delay, degraded tracks slow traffic, congestion drifts.
+        for _ in range(ticks):
+            future.tick()
+
         delay_score = future.calculate_delay()
         risk_score = future.calculate_risk()
         
@@ -31,6 +46,9 @@ class FutureTimelineSimulator:
         )
 
     def run(self, scenarios_config):
+        if not scenarios_config:
+            raise ValueError("no scenarios provided")
+
         scenarios = []
         best_scenario = None
         best_score = float("inf")

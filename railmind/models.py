@@ -34,6 +34,9 @@ class TrainState(BaseModel):
     speed_kmh: float
     passengers: int
     delayed_minutes: float
+    route_index: int = 0        # position of current_station within route
+    progress: float = 0.0       # 0..1 along the edge to the next station
+    held: bool = False          # true while blocked by a closed track ahead
 
 class StationNode(BaseModel):
     station_id: str

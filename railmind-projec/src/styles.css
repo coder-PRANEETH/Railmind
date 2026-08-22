@@ -112,6 +112,23 @@
   @keyframes mc-dash {
     to { stroke-dashoffset: -24; }
   }
+  /* The one authored moment: urgency moving up a rung. Fires on escalation
+     only — a de-escalation needs no alarm — and settles on its own. */
+  .escalation-raised {
+    animation: mc-raise 1.4s cubic-bezier(0.16, 1, 0.3, 1) 1;
+  }
+  @keyframes mc-raise {
+    0%   { box-shadow: 0 0 0 1px oklch(0.65 0.23 25 / 0.65), 0 0 0 oklch(0.65 0.23 25 / 0.45);
+           transform: translateY(-2px); }
+    35%  { box-shadow: 0 0 0 1px oklch(0.65 0.23 25 / 0.5), 0 10px 44px oklch(0.65 0.23 25 / 0.32);
+           transform: translateY(0); }
+    100% { box-shadow: 0 0 0 1px oklch(0.65 0.23 25 / 0), 0 10px 44px oklch(0.65 0.23 25 / 0);
+           transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .escalation-raised { animation: none; }
+    .dash-flow { animation: none; }
+  }
 }
 
 .pulse-dot{

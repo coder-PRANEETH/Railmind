@@ -1,9 +1,17 @@
+import sys
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import networkx as nx
-from data_loader import load_railway
-from graph import build_network_from_data
-from twin import DigitalTwin
-from simulator import FutureTimelineSimulator, default_scenarios
+
+if __package__ in (None, ""):
+    # Running as a plain script: make the repo root importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from railmind.data_loader import load_railway
+from railmind.graph import build_network_from_data
+from railmind.simulator import FutureTimelineSimulator, default_scenarios
+from railmind.twin import DigitalTwin
 
 def plot_graph_and_sim():
     # Load data

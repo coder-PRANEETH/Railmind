@@ -1,7 +1,27 @@
+"""Network data loading for RailMind.
+
+Offline-first: the bundled canonical India network (data/india_network.json)
+is used by default so every layer of the stack sees the exact same stations
+and tracks — no internet required. Live OpenStreetMap loading via the
+Overpass API is opt-in with RAILMIND_LIVE_OSM=1 (results are cached on disk,
+and any failure falls back to the bundled network).
+"""
+
+import hashlib
+import json
 import math
+import os
+from pathlib import Path
+
+import networkx as nx
 import requests
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+BUNDLED_NETWORK_FILE = DATA_DIR / "india_network.json"
+OSM_CACHE_FILE = DATA_DIR / "osm_cache.json"
+
 
 def haversine(lat1, lon1, lat2, lon2):
     r = 6371.0
@@ -12,6 +32,34 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(delta_phi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return r * c
+
+
+def stable_track_health(u, v):
+    """Deterministic pseudo-random health in [0.55, 0.99] for a station pair.
+
+    Built on md5 rather than hash() because Python salts string hashes per
+    process — health values must survive restarts and match across services.
+    """
+    digest = hashlib.md5("|".join(sorted((u, v))).encode()).hexdigest()
+    return round(0.55 + (int(digest[:8], 16) % 45) / 100, 2)
+
+
+def load_bundled_network():
+    """Load the canonical demo network shipped with the repo."""
+    raw = json.loads(BUNDLED_NETWORK_FILE.read_text(encoding="utf-8"))
+    stations = raw["stations"]
+    by_id = {s["station_id"]: s for s in stations}
+
+    tracks = []
+    for tr in raw["tracks"]:
+        src = by_id[tr["source"]]
+        dst = by_id[tr["destination"]]
+        tracks.append({
+            **tr,
+            "length_km": round(haversine(src["lat"], src["lon"], dst["lat"], dst["lon"]), 1),
+        })
+    return stations, tracks
+
 
 def fetch_osm_railway(area_name):
     if area_name == "India":
@@ -40,11 +88,12 @@ def fetch_osm_railway(area_name):
     response.raise_for_status()
     return response.json()
 
+
 def parse_osm_data(raw):
     stations = []
     tracks = []
     station_lookup = {}
-    
+
     all_nodes = {el["id"]: el for el in raw.get("elements", []) if el.get("type") == "node"}
     way_node_ids = {n for el in raw.get("elements", []) if el.get("type") == "way" and el.get("tags", {}).get("railway") == "rail" for n in el.get("nodes", [])}
 
@@ -56,7 +105,7 @@ def parse_osm_data(raw):
                 station_id = name.upper().replace(" ", "_")[:12]
             else:
                 station_id = f"STN_{osm_id}"
-            
+
             station_data = {
                 "osm_id": osm_id,
                 "station_id": station_id,
@@ -66,7 +115,7 @@ def parse_osm_data(raw):
             }
             stations.append(station_data)
             station_lookup[osm_id] = station_data
-            
+
             dists = []
             for n_id in way_node_ids:
                 if n_id in all_nodes:
@@ -77,13 +126,13 @@ def parse_osm_data(raw):
                     station_lookup[closest] = station_data
 
     ways = [el for el in raw.get("elements", []) if el.get("type") == "way" and el.get("tags", {}).get("railway") == "rail"]
-    
+
     if not ways and len(stations) > 0:
         # India dynamic mode: Filter real stations and build MST
         target_cities = ["New Delhi", "Mumbai", "Howrah", "Chennai", "Bengaluru", "Secunderabad", "Ahmedabad", "Jaipur", "Bhopal", "Lucknow", "Patna", "Bhubaneswar", "Guwahati", "Nagpur", "Pune", "Thiruvananthapuram", "Ranchi", "Raipur", "Dehradun", "Chandigarh", "Jammu"]
         filtered_stations = []
         used_cities = set()
-        
+
         for city in target_cities:
             best_match = None
             best_score = -1
@@ -93,48 +142,47 @@ def parse_osm_data(raw):
                     score = 0
                     lower_name = name.lower()
                     lower_city = city.lower()
-                    
+
                     if lower_name == lower_city:
                         score += 100
                     elif lower_name == f"{lower_city} junction" or lower_name == f"{lower_city} central":
                         score += 90
                     elif lower_name.startswith(lower_city):
                         score += 50
-                        
+
                     if "Junction" in name or "Central" in name or "Terminus" in name or "Cantt" in name:
                         score += 30
                     if "Nursing" in name or "Metro" in name or "East" in name or "West" in name:
                         score -= 50
                     if len(name) - len(city) < 10:
                         score += 10
-                        
+
                     if score > best_score:
                         best_score = score
                         best_match = s
-                        
+
             if best_match:
                 # Clean up the name for the plot if it's too long
                 if len(best_match["name"]) > 20:
                     best_match["name"] = city + (" Jn" if "Junction" in best_match["name"] else "")
                 filtered_stations.append(best_match)
                 used_cities.add(city)
-        
+
         if not filtered_stations:
             filtered_stations = stations[:20]
-            
-        import networkx as nx
+
         G = nx.Graph()
         for s in filtered_stations:
             G.add_node(s["station_id"])
-        
+
         for s1 in filtered_stations:
             for s2 in filtered_stations:
                 if s1["station_id"] != s2["station_id"]:
                     d = haversine(s1["lat"], s1["lon"], s2["lat"], s2["lon"])
                     G.add_edge(s1["station_id"], s2["station_id"], weight=d)
-                    
+
         mst = nx.minimum_spanning_tree(G)
-        
+
         edges_to_add = []
         for n in mst.nodes():
             neighbors = sorted([(G[n][nbr]['weight'], nbr) for nbr in G.neighbors(n)])
@@ -142,35 +190,34 @@ def parse_osm_data(raw):
                 if not mst.has_edge(n, nbr) and w < 1200:
                     edges_to_add.append((n, nbr, w))
                     break
-                    
+
         for u, v, w in edges_to_add:
             mst.add_edge(u, v, weight=w)
-            
+
         track_count = 1
         for u, v, data_dict in mst.edges(data=True):
             dist = data_dict['weight']
-            health = round(0.55 + (abs(hash(frozenset({u, v}))) % 45) / 100, 2)
             tracks.append({
                 "track_id": f"T{track_count:02d}",
                 "source": u,
                 "destination": v,
                 "length_km": dist,
                 "max_speed_kmh": 130.0,
-                "health": health
+                "health": stable_track_health(u, v)
             })
             track_count += 1
-            
+
         return filtered_stations, tracks
 
     seen_pairs = set()
     track_count = 1
-    
+
     for el in raw.get("elements", []):
         if el.get("type") == "way" and el.get("tags", {}).get("railway") == "rail":
             refs = [r for r in el.get("nodes", []) if r in station_lookup]
             if len(refs) < 2:
                 continue
-            
+
             tags = el.get("tags", {})
             maxspeed_str = tags.get("maxspeed", "120")
             maxspeed_str = maxspeed_str.replace(" mph", "")
@@ -178,42 +225,77 @@ def parse_osm_data(raw):
                 max_speed_kmh = float(maxspeed_str)
             except ValueError:
                 max_speed_kmh = 120.0
-            
+
             max_speed_kmh = min(max_speed_kmh, 200.0)
-            
+
             for i in range(len(refs) - 1):
                 src_osm_id = refs[i]
                 dst_osm_id = refs[i+1]
                 src_station = station_lookup[src_osm_id]
                 dst_station = station_lookup[dst_osm_id]
-                
+
                 dist = haversine(src_station["lat"], src_station["lon"], dst_station["lat"], dst_station["lon"])
                 if dist < 0.1:
                     continue
-                
+
                 pair = frozenset({src_osm_id, dst_osm_id})
                 if pair in seen_pairs:
                     continue
                 seen_pairs.add(pair)
-                
-                health = round(0.55 + (abs(hash(pair)) % 45) / 100, 2)
+
                 track_id = f"T{track_count:02d}"
                 track_count += 1
-                
+
                 tracks.append({
                     "track_id": track_id,
                     "source": src_station["station_id"],
                     "destination": dst_station["station_id"],
                     "length_km": dist,
                     "max_speed_kmh": max_speed_kmh,
-                    "health": health
+                    "health": stable_track_health(src_station["station_id"], dst_station["station_id"])
                 })
-                
+
     return stations, tracks
 
-def load_railway(area_name):
-    raw = fetch_osm_railway(area_name)
+
+def _load_live_osm(area_name):
+    """Fetch (or reuse cached) OSM data and parse it into stations/tracks."""
+    raw = None
+    if OSM_CACHE_FILE.exists():
+        try:
+            cached = json.loads(OSM_CACHE_FILE.read_text(encoding="utf-8"))
+            if cached.get("area") == area_name:
+                raw = cached["raw"]
+        except (json.JSONDecodeError, KeyError):
+            raw = None
+
+    if raw is None:
+        raw = fetch_osm_railway(area_name)
+        try:
+            OSM_CACHE_FILE.write_text(json.dumps({"area": area_name, "raw": raw}), encoding="utf-8")
+        except OSError:
+            pass
+
     stations, tracks = parse_osm_data(raw)
     if len(stations) < 3 or len(tracks) < 2:
         raise ValueError(f"Insufficient network data for area '{area_name}'")
     return stations, tracks
+
+
+def load_railway(area_name="India", live=None):
+    """Return (stations, tracks) for the given area.
+
+    live=None reads RAILMIND_LIVE_OSM from the environment; the bundled
+    canonical network is the default so demos work with no internet.
+    """
+    if live is None:
+        live = os.environ.get("RAILMIND_LIVE_OSM", "").lower() in ("1", "true", "yes")
+
+    if not live:
+        return load_bundled_network()
+
+    try:
+        return _load_live_osm(area_name)
+    except Exception as exc:
+        print(f"[RailMind] Live OSM load failed ({exc}); using bundled network.")
+        return load_bundled_network()

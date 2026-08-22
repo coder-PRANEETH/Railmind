@@ -1,0 +1,43 @@
+# One-command RailMind stack:  docker compose up
+#   twin    → http://localhost:8000   (Django digital twin; single worker — twin state is in-memory)
+#   agents  → http://localhost:8001   (FastAPI + LangGraph orchestrator)
+#   console → http://localhost:8080   (React operator console, dev server)
+
+services:
+  twin:
+    build:
+      context: .
+      dockerfile: railmind_django/Dockerfile
+    ports:
+      - "8000:8000"
+
+  agents:
+    build:
+      context: .
+      dockerfile: agents/Dockerfile
+    environment:
+      TWIN_BASE_URL: http://twin:8000
+      # Optional: enables LLM-written plan explanations
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "8001:8001"
+    depends_on:
+      - twin
+
+  console:
+    image: node:22-slim
+    working_dir: /app
+    volumes:
+      - ./railmind-projec:/app
+      - console_node_modules:/app/node_modules
+    environment:
+      # Browser-side URL — must point at the host-published agents port
+      VITE_API_BASE_URL: http://localhost:8001
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - agents
+
+volumes:
+  console_node_modules:

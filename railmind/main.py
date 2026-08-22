@@ -1,39 +1,54 @@
+"""RailMind CLI demo — build the digital twin and run the future simulator.
+
+Run from the repo root:
+    python -m railmind.main
+or directly:
+    python railmind/main.py
+"""
+
 import sys
-from data_loader import load_railway
-from graph import build_network_from_data
-from twin import DigitalTwin
-from simulator import FutureTimelineSimulator, default_scenarios
+from pathlib import Path
+
+if __package__ in (None, ""):
+    # Running as a plain script: make the repo root importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from railmind.data_loader import load_railway
+from railmind.graph import build_network_from_data
+from railmind.simulator import FutureTimelineSimulator, default_scenarios
+from railmind.twin import DigitalTwin
+
 
 def main():
     stations, tracks = load_railway("India")
     area_loaded = "India"
-            
+
     graph = build_network_from_data(stations, tracks)
     twin = DigitalTwin(graph)
     twin.seed_trains(5)
-    
+
     print("Network Summary")
     print("---------------")
     print(f"Area:           {area_loaded}")
     print(f"Stations:       {len(twin.state.stations)}")
     print(f"Tracks:         {len(twin.state.tracks)}")
     print(f"Trains:         {len(twin.state.trains)}\n")
-    
+
     simulator = FutureTimelineSimulator(twin)
     scenarios_config = default_scenarios(twin)
     result = simulator.run(scenarios_config)
-    
+
     print("Simulation Results")
     print("------------------")
     print(f"Best Scenario:  {result.best_scenario}")
     print(f"Confidence:     {result.confidence:.2f}")
-    print("Recommended:    " + ", ".join(result.recommended_actions) if result.recommended_actions else "Recommended:    None")
+    print("Recommended:    " + (", ".join(result.recommended_actions) if result.recommended_actions else "None"))
     print()
-    
+
     for score in result.scenarios:
         print(f"Scenario {score.scenario_id}: Total Score = {score.total_score:.2f} (Delay={score.delay_score:.2f}, Risk={score.risk_score:.2f})")
     print()
-    
+
     if len(twin.state.stations) >= 2:
         s1, s2 = list(twin.state.stations.keys())[:2]
         try:
@@ -43,20 +58,21 @@ def main():
         except ValueError:
             print(f"No route found between {s1} and {s2}.")
     print()
-    
+
     if twin.state.tracks:
         worst_track = min(twin.state.tracks.values(), key=lambda t: t.health)
         t_id = worst_track.track_id
-        
+
         risk_before = twin.calculate_risk()
         twin.close_track(t_id)
         risk_after = twin.calculate_risk()
-        
+
         print("Track Maintenance Demo")
         print("----------------------")
         print(f"Closing track {t_id}")
         print(f"Risk Score Before: {risk_before:.2f}")
         print(f"Risk Score After:  {risk_after:.2f}")
+
 
 if __name__ == "__main__":
     main()

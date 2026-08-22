@@ -1,0 +1,34 @@
+# Render blueprint — deploys the two RailMind backend services.
+# The operator console (railmind-projec/) is an SSR app; publish it via Lovable
+# or run it locally with VITE_API_BASE_URL pointing at railmind-agents.
+
+services:
+  - type: web
+    name: railmind-twin
+    runtime: python
+    plan: free
+    buildCommand: pip install -r railmind_django/requirements.txt
+    # --workers 1: twin state is in-process; more workers would each hold their own twin.
+    startCommand: cd railmind_django && gunicorn railmind_django.wsgi:application --bind 0.0.0.0:$PORT --workers 1
+    healthCheckPath: /api/state/
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: "false"
+      # Leading dot = any *.onrender.com subdomain (covers the Render-assigned hostname).
+      - key: DJANGO_ALLOWED_HOSTS
+        value: .onrender.com
+
+  - type: web
+    name: railmind-agents
+    runtime: python
+    plan: free
+    buildCommand: pip install -r agents/requirements.txt
+    startCommand: cd agents && uvicorn all_agent:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      # Public URL of the railmind-twin service (e.g. https://railmind-twin.onrender.com).
+      # Leave unset to let the orchestrator fall back to its embedded twin.
+      - key: TWIN_BASE_URL
+        sync: false
