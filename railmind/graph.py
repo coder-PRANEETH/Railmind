@@ -1,5 +1,5 @@
 import networkx as nx
-from .models import TrackStatus
+from .models import IMPASSABLE_TRACK_STATUSES, TrackStatus
 
 class RailwayGraph:
     def __init__(self):
@@ -25,14 +25,22 @@ class RailwayGraph:
                 self.graph.edges[u, v]["status"] = TrackStatus.CLOSED
                 self.graph.edges[u, v]["health"] = 0.0
 
+    def set_track_status(self, track_id, status, health=None):
+        """Set a track's status (and optionally health) on both directed edges."""
+        for u, v, data in self.graph.edges(data=True):
+            if data.get("track_id") == track_id:
+                self.graph.edges[u, v]["status"] = status
+                if health is not None:
+                    self.graph.edges[u, v]["health"] = health
+
     def find_route(self, source, destination):
         if source == destination:
             return []
-            
+
         def weight_func(u, v, d):
             # Returning None hides the edge from NetworkX entirely; a float
             # (even inf) is treated as an ordinary traversable weight.
-            if d.get("status") == TrackStatus.CLOSED:
+            if d.get("status") in IMPASSABLE_TRACK_STATUSES:
                 return None
             base = d.get("length_km", 0.0) / d.get("max_speed_kmh", 1.0)
             if d.get("status") == TrackStatus.DEGRADED:

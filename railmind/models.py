@@ -1,11 +1,22 @@
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pydantic import BaseModel, model_validator
 
 class TrackStatus(str, Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
     DEGRADED = "DEGRADED"
+    # Transitional states driven by field work: a section being taken out of
+    # service, and one a crew is actively rebuilding. Both hold traffic.
+    CLOSING = "CLOSING"
+    UNDER_REPAIR = "UNDER_REPAIR"
+
+# Trains cannot traverse these; routing hides them exactly like a closure.
+IMPASSABLE_TRACK_STATUSES = frozenset({
+    TrackStatus.CLOSED,
+    TrackStatus.CLOSING,
+    TrackStatus.UNDER_REPAIR,
+})
 
 class SignalStatus(str, Enum):
     GREEN = "GREEN"
@@ -26,6 +37,9 @@ class TrackSegment(BaseModel):
     status: TrackStatus
     length_km: float
     max_speed_kmh: float
+    # Temporary operational limit posted by a SPEED_RESTRICT task; trains run
+    # at min(own speed, line speed, restriction) while it is in force.
+    speed_restriction_kmh: Optional[float] = None
 
 class TrainState(BaseModel):
     train_id: str
@@ -37,6 +51,11 @@ class TrainState(BaseModel):
     route_index: int = 0        # position of current_station within route
     progress: float = 0.0       # 0..1 along the edge to the next station
     held: bool = False          # true while blocked by a closed track ahead
+    # A HOLD_TRAIN work-order task sets this separately from ``held``.  The
+    # latter is recalculated by every movement tick, while this flag records
+    # an operator's deliberate stop and keeps the train stopped until a
+    # later operational decision releases it.
+    manual_hold: bool = False
 
 class StationNode(BaseModel):
     station_id: str

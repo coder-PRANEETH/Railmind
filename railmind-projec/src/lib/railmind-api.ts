@@ -95,8 +95,81 @@ export type Incident = {
     actions_total: number;
   };
   drivers: EscalationDriver[];
+  /** The twin's work order on this corridor, when one exists (context, not the signal). */
+  field_work?: FieldWork | null;
   work_items: WorkItem[];
   events: IncidentEvent[];
+};
+
+// ── Field work: the twin's work orders ──────────────────────────────────────
+// Executed by the digital twin over simulation ticks; a task is COMPLETED only
+// when the twin reads back the physical state that proves it.
+
+export type TaskStatus =
+  | "PENDING"
+  | "IN_PROGRESS"
+  | "COMPLETED"
+  | "BLOCKED"
+  | "UNRESOLVED"
+  | "CANCELLED";
+export type WorkOrderStatus = Resolution | "CANCELLED";
+
+export type FieldTask = {
+  id: string;
+  action: string;
+  target: string;
+  status: TaskStatus;
+  ticks_required: number;
+  ticks_remaining: number;
+  progress: number; // 0..1
+  depends_on: string[];
+  blocking_reason: string | null;
+  detail: string;
+  started_tick: number | null;
+  completed_tick: number | null;
+  params?: Record<string, unknown>;
+};
+
+export type WorkOrderEvent = { tick: number; kind: string; task_id: string | null; detail: string };
+
+export type WorkOrder = {
+  id: string;
+  incident_id: string | null;
+  type: string;
+  target: string;
+  status: WorkOrderStatus;
+  completion_percentage: number;
+  estimated_ticks_remaining: number;
+  created_tick: number;
+  cancelled: boolean;
+  cancel_reason: string | null;
+  auto_retry: boolean;
+  tasks: FieldTask[];
+  events: WorkOrderEvent[];
+};
+
+export type CrewUnit = {
+  id: string;
+  target: string;
+  status: "EN_ROUTE" | "ON_SITE" | string;
+  work_order_id: string;
+  task_id: string;
+  dispatched_tick: number;
+  arrived_tick: number | null;
+};
+
+/** Summary the ledger attaches to an incident from the twin's snapshot. */
+export type FieldWork = {
+  id: string;
+  status: WorkOrderStatus;
+  completion_percentage: number;
+  estimated_ticks_remaining: number;
+  blocked_reason: string | null;
+  current: string | null;
+  tasks: Pick<
+    FieldTask,
+    "id" | "action" | "status" | "progress" | "ticks_remaining" | "blocking_reason" | "detail"
+  >[];
 };
 
 export type Escalation = {
@@ -154,6 +227,10 @@ export type LiveState = {
   trains: Train[];
   tracks: LiveTrack[];
   weather: Record<string, string>;
+  // Field work rides along with the fleet so one poll covers both
+  sim_tick?: number;
+  work_orders?: WorkOrder[];
+  crews?: Record<string, CrewUnit>;
 };
 
 const API_BASE_URL: string =
@@ -726,6 +803,92 @@ export async function draftBrief(incidentId: string): Promise<HandoffBrief | nul
     return typeof json?.text === "string" ? json : null;
   } catch {
     return null;
+  }
+}
+
+// ── Field work ──────────────────────────────────────────────────────────────
+// Every verb here is carried out by the twin; the agent service relays its
+// answer. Offline, or refused by the twin, reads as null — the console never
+// fabricates field progress, because done is proved, not claimed.
+
+function isWorkOrder(x: unknown): x is WorkOrder {
+  if (!x || typeof x !== "object") return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o.id === "string" &&
+    typeof o.status === "string" &&
+    typeof o.target === "string" &&
+    Array.isArray(o.tasks)
+  );
+}
+
+/** Work orders on the live twin. Null when the backend is offline. */
+export async function fetchWorkOrders(): Promise<WorkOrder[] | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(`${API_BASE_URL}/workorders`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const json = (await res.json()) as { work_orders?: unknown };
+    const orders = json?.work_orders;
+    return Array.isArray(orders) && orders.every(isWorkOrder) ? orders : null;
+  } catch {
+    return null;
+  }
+}
+
+async function postWorkOrderVerb(path: string, timeoutMs = 8000): Promise<WorkOrder | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(`${API_BASE_URL}${path}`, {
+      method: "POST",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const json = (await res.json()) as { work_order?: unknown };
+    return isWorkOrder(json?.work_order) ? json.work_order : null;
+  } catch {
+    return null;
+  }
+}
+
+/** BLOCKED → PENDING for one task, or every blocked task in the order. */
+export function retryWorkOrder(workOrderId: string, taskId?: string): Promise<WorkOrder | null> {
+  const query = taskId ? `?task_id=${encodeURIComponent(taskId)}` : "";
+  return postWorkOrderVerb(`/workorders/${encodeURIComponent(workOrderId)}/retry${query}`);
+}
+
+/** Cancel an order; the twin aborts work in flight and puts assets back. */
+export function cancelWorkOrder(
+  workOrderId: string,
+  reason = "Cancelled by operator",
+): Promise<WorkOrder | null> {
+  return postWorkOrderVerb(
+    `/workorders/${encodeURIComponent(workOrderId)}/cancel?reason=${encodeURIComponent(reason)}`,
+  );
+}
+
+/** Order the twin's standard response on a failed section: close, crew, repair. */
+export function dispatchFieldWork(trackId: string): Promise<WorkOrder | null> {
+  return postWorkOrderVerb(`/workorders/incident-response/${encodeURIComponent(trackId)}`);
+}
+
+/** Fast-forward the twin so field work plays out on demand. True if it ran. */
+export async function advanceTwin(ticks = 5): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(`${API_BASE_URL}/workorders/tick?ticks=${ticks}`, {
+      method: "POST",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
