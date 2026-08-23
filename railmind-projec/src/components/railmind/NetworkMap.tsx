@@ -17,6 +17,13 @@ const WEATHER_GLYPH: Record<string, string> = {
   FOG: "🌫",
 };
 
+const MAP_COLORS = {
+  success: "#22c55e",
+  warning: "#eab308",
+  danger: "#ef4444",
+  info: "#3b82f6",
+} as const;
+
 export function NetworkMap({
   trains = TRAINS,
   failedTracks = [],
@@ -44,9 +51,9 @@ export function NetworkMap({
   });
 
   function strokeFor(status: Track["status"]) {
-    if (status === "closed") return "var(--danger)";
-    if (status === "monitored") return "var(--warning)";
-    return "var(--success)";
+    if (status === "closed") return MAP_COLORS.danger;
+    if (status === "monitored") return MAP_COLORS.warning;
+    return MAP_COLORS.success;
   }
 
   // Live train positions: interpolate between the current station and the next
@@ -134,7 +141,7 @@ export function NetworkMap({
                 strokeOpacity={isFailed ? 0.9 : 0.55}
                 strokeWidth={isFailed ? 4 : 2.5}
                 className={isFailed ? "dash-flow" : undefined}
-                style={{ filter: isFailed ? "drop-shadow(0 0 6px var(--danger))" : undefined }}
+                style={{ filter: isFailed ? `drop-shadow(0 0 6px ${MAP_COLORS.danger})` : undefined }}
               />
               <line
                 x1={a.x}
@@ -160,11 +167,11 @@ export function NetworkMap({
               key={p.id + idx}
               d={d}
               fill="none"
-              stroke="var(--info)"
+              stroke={MAP_COLORS.info}
               strokeWidth={3}
               strokeOpacity={0.85}
               className="dash-flow"
-              style={{ filter: "drop-shadow(0 0 6px var(--info))" }}
+              style={{ filter: `drop-shadow(0 0 6px ${MAP_COLORS.info})` }}
             />
           );
         })}
@@ -181,7 +188,7 @@ export function NetworkMap({
                 <path
                   d={d}
                   fill="none"
-                  stroke="var(--info)"
+                  stroke={MAP_COLORS.info}
                   strokeWidth={8}
                   strokeOpacity={0.25}
                   strokeLinecap="round"
@@ -190,12 +197,12 @@ export function NetworkMap({
                 <path
                   d={d}
                   fill="none"
-                  stroke="var(--info)"
+                  stroke={MAP_COLORS.info}
                   strokeWidth={3.5}
                   strokeLinecap="round"
                   strokeLinejoin="round"
                   className="dash-flow"
-                  style={{ filter: "drop-shadow(0 0 8px var(--info))" }}
+                  style={{ filter: `drop-shadow(0 0 8px ${MAP_COLORS.info})` }}
                 />
                 {pts.map((pt, i) => (
                   <circle
@@ -203,17 +210,17 @@ export function NetworkMap({
                     cx={pt.x}
                     cy={pt.y}
                     r={6}
-                    fill="var(--info)"
+                    fill={MAP_COLORS.info}
                     stroke="oklch(0.16 0.03 260)"
                     strokeWidth={2}
-                    style={{ filter: "drop-shadow(0 0 6px var(--info))" }}
+                    style={{ filter: `drop-shadow(0 0 6px ${MAP_COLORS.info})` }}
                   />
                 ))}
                 {highlightedTrainId && pts[0] && (
                   <text
                     x={pts[0].x + 14}
                     y={pts[0].y - 10}
-                    fill="var(--info)"
+                    fill={MAP_COLORS.info}
                     fontSize={11}
                     className="font-mono-mc"
                     fontWeight={700}
@@ -233,7 +240,7 @@ export function NetworkMap({
               cy={w.y}
               r={11}
               fill="oklch(0.2 0.03 260 / 0.85)"
-              stroke="var(--info)"
+              stroke={MAP_COLORS.info}
               strokeWidth={1}
               strokeOpacity={0.5}
             />
@@ -254,16 +261,16 @@ export function NetworkMap({
           >
             <circle
               r={5.5}
-              fill={d.held ? "var(--danger)" : "var(--info)"}
+              fill={d.held ? MAP_COLORS.danger : MAP_COLORS.info}
               stroke="oklch(0.14 0.02 260)"
               strokeWidth={1.5}
               className={d.held ? "pulse-dot" : undefined}
-              style={{ filter: `drop-shadow(0 0 6px ${d.held ? "var(--danger)" : "var(--info)"})` }}
+              style={{ filter: `drop-shadow(0 0 6px ${d.held ? MAP_COLORS.danger : MAP_COLORS.info})` }}
             />
             <text
               x={8}
               y={-6}
-              fill={d.held ? "var(--danger)" : "var(--info)"}
+              fill={d.held ? MAP_COLORS.danger : MAP_COLORS.info}
               fontSize={9}
               className="font-mono-mc"
               fontWeight={700}
@@ -288,11 +295,11 @@ export function NetworkMap({
                 cy={s.y}
                 r={active ? 14 : 10}
                 fill="oklch(0.2 0.03 260)"
-                stroke="var(--success)"
+                stroke={MAP_COLORS.success}
                 strokeWidth={2}
                 style={{ filter: "drop-shadow(0 0 6px oklch(0.72 0.18 145 / 0.6))" }}
               />
-              <circle cx={s.x} cy={s.y} r={4} fill="var(--success)" className="pulse-dot" />
+              <circle cx={s.x} cy={s.y} r={4} fill={MAP_COLORS.success} className="pulse-dot" />
               <text
                 x={s.x + 14}
                 y={s.y + 4}
@@ -317,20 +324,20 @@ export function NetworkMap({
       {/* Legend */}
       <div className="absolute right-3 bottom-3 glass rounded-md px-3 py-2 text-[11px] font-mono-mc flex gap-3 items-center">
         <span className="flex items-center gap-1.5">
-          <i className="inline-block h-2 w-2 rounded-full bg-success" />
-          Healthy
+          <i className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: MAP_COLORS.success }} />
+          <span>Healthy</span>
         </span>
         <span className="flex items-center gap-1.5">
-          <i className="inline-block h-2 w-2 rounded-full bg-warning" />
-          Monitored
+          <i className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: MAP_COLORS.warning }} />
+          <span>Monitored</span>
         </span>
         <span className="flex items-center gap-1.5">
-          <i className="inline-block h-2 w-2 rounded-full bg-danger" />
-          Closed
+          <i className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: MAP_COLORS.danger }} />
+          <span>Closed</span>
         </span>
         <span className="flex items-center gap-1.5">
-          <i className="inline-block h-2 w-2 rounded-full bg-info" />
-          Reroute
+          <i className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: MAP_COLORS.info }} />
+          <span>Reroute</span>
         </span>
       </div>
 

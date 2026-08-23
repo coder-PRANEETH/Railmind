@@ -524,7 +524,7 @@ export function Dashboard() {
   return (
     <div className="min-h-screen text-foreground">
       {/* Header */}
-      <header className="sticky top-0 z-30 glass border-b">
+      <header className="portfolio-header sticky top-0 z-30 border-b">
         <div className="mx-auto max-w-[1600px] px-5 py-3 flex items-center gap-4">
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-lg bg-success/15 glow-green">
@@ -538,7 +538,7 @@ export function Dashboard() {
             </div>
           </div>
 
-          <div className="hidden md:flex items-center gap-6 ml-6 pl-6 border-l border-border">
+          <div className="hidden xl:flex items-center gap-6 ml-6 pl-6 border-l border-border">
             <div>
               <div className="text-[10px] text-muted-foreground font-mono-mc uppercase">
                 System Status
@@ -554,6 +554,12 @@ export function Dashboard() {
               </div>
             </div>
           </div>
+
+          <nav className="dashboard-nav hidden 2xl:flex" aria-label="Primary navigation">
+            <span className="dashboard-nav-active">Dashboard</span>
+            <span>Live Twin</span>
+            <span>Analytics</span>
+          </nav>
 
           <div className="ml-auto flex items-center gap-2">
             <div className="hidden sm:flex items-center gap-2 glass rounded-md px-2 py-1.5">
@@ -577,7 +583,7 @@ export function Dashboard() {
                 variant="destructive"
                 onClick={doInject}
                 disabled={loading}
-                className="h-8"
+                className="nav-action-button h-8"
               >
                 <Siren className="h-4 w-4 mr-1.5" />
                 Inject Failure
@@ -587,7 +593,7 @@ export function Dashboard() {
                 variant="outline"
                 onClick={doStorm}
                 disabled={loading}
-                className="h-8 text-info border-info/40 hover:bg-info/10"
+                className="nav-action-button h-8 text-info border-info/40 hover:bg-info/10"
               >
                 <CloudLightning className="h-4 w-4 mr-1.5" />
                 Storm
@@ -607,7 +613,7 @@ export function Dashboard() {
               size="sm"
               onClick={doRun}
               disabled={loading}
-              className="h-9 bg-success text-primary-foreground hover:bg-success/90 glow-green"
+              className="nav-action-button h-9 bg-success text-primary-foreground hover:bg-success/90 glow-green"
             >
               {loading ? (
                 <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
@@ -620,7 +626,7 @@ export function Dashboard() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] px-5 py-5 grid grid-cols-12 gap-4">
+      <main className="mx-auto max-w-[1600px] px-5 py-3 grid grid-cols-12 gap-1">
         {/* Escalation rail — handling level, owner, completion signal */}
         <EscalationRail escalation={escalation} offline={escalationOffline} />
 
@@ -702,7 +708,7 @@ export function Dashboard() {
         </Card>
 
         {/* Map */}
-        <Card className="col-span-12 lg:col-span-6 p-0 glass overflow-hidden">
+        <Card className="col-span-12 lg:col-span-5 p-0 glass overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-border">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-info" />
@@ -730,7 +736,7 @@ export function Dashboard() {
         </Card>
 
         {/* Trains */}
-        <div className="col-span-12 lg:col-span-3">
+        <div className="col-span-12 lg:col-span-4">
           <TrainsPanel
             trains={trains}
             selectedTrain={selectedTrain}
@@ -741,7 +747,7 @@ export function Dashboard() {
         </div>
 
         {/* Agent decisions */}
-        <div className="col-span-12 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        <div className="col-span-12 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-1">
           <AgentCard icon={<Cloud className="h-4 w-4" />} title="Weather Agent" color="text-info">
             <Metric label="Strategy" value={data?.agent_outputs.weather.strategy ?? "—"} />
             <Metric
@@ -822,7 +828,7 @@ export function Dashboard() {
           {plans.length === 0 ? (
             <EmptyHint text="Run a simulation to generate candidate plans." />
           ) : (
-            <div className="grid sm:grid-cols-3 gap-3">
+            <div className="grid sm:grid-cols-3 gap-1">
               {plans.map((p) => {
                 const c = planColor(p.score, scores);
                 const isBest = p.id === data?.recommended_action.id;
@@ -930,7 +936,7 @@ export function Dashboard() {
                 </div>
               )}
 
-              <div className="grid grid-cols-3 gap-3 mt-4">
+              <div className="grid grid-cols-3 gap-2 mt-4">
                 <Metric
                   label="Expected Delay"
                   value={`${data.recommended_action.delay_min}m`}
@@ -1068,7 +1074,7 @@ export function Dashboard() {
                       <ChartTooltip
                         cursor={{ stroke: "var(--info)", strokeOpacity: 0.4 }}
                         contentStyle={{
-                          background: "oklch(0.18 0.03 260)",
+                          background: "#111111",
                           border: "1px solid var(--border)",
                           borderRadius: 8,
                           fontSize: 11,
@@ -1114,7 +1120,7 @@ export function Dashboard() {
                       <ChartTooltip
                         cursor={{ fill: "var(--info)", fillOpacity: 0.08 }}
                         contentStyle={{
-                          background: "oklch(0.18 0.03 260)",
+                          background: "#111111",
                           border: "1px solid var(--border)",
                           borderRadius: 8,
                           fontSize: 11,
