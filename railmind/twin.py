@@ -1,6 +1,7 @@
 import time
 import copy
 import random
+import os
 from typing import Dict, List, Optional
 from .models import (
     IMPASSABLE_TRACK_STATUSES,
@@ -71,6 +72,13 @@ class DigitalTwin:
         self.sim_tick = 0
         self.work_orders: Dict[str, WorkOrder] = {}
         self.crews: Dict[str, CrewUnit] = {}
+        # These are genuinely shared by every work order registered on this
+        # twin, not merely descriptive plan metadata.  Tests and deployments
+        # may override them on the twin instance or with environment values.
+        self.crew_capacities = {
+            "repair": max(0, int(os.environ.get("REPAIR_CREWS", "2"))),
+            "signal": max(0, int(os.environ.get("SIGNAL_CREWS", "1"))),
+        }
         self._wo_seq = 0
         self._crew_seq = 0
 
@@ -127,6 +135,7 @@ class DigitalTwin:
             train.route_index = 0
             train.progress = 0.0
             train.held = False
+            train.manual_hold = False
 
     def apply_action(self, action_string):
         """Apply a generic string-encoded action to the twin.
@@ -308,6 +317,10 @@ class DigitalTwin:
             # same RNG stream as clones that do not.
             jitter = rng.random()
             route = train.route
+            if train.manual_hold:
+                train.held = True
+                train.delayed_minutes += minutes
+                continue
             if len(route) < 2:
                 continue
 
@@ -424,6 +437,14 @@ class DigitalTwin:
                 if not isinstance(task, dict):
                     raise ValueError("Each task must be an object")
                 task = dict(task)
+                # ``dependencies`` is the external spelling used by agent
+                # proposals.  The execution engine historically calls the
+                # same relationship ``depends_on``; accept either but never
+                # silently accept conflicting declarations.
+                if "dependencies" in task:
+                    if "depends_on" in task and task["depends_on"] != task["dependencies"]:
+                        raise ValueError("Task dependencies and depends_on disagree")
+                    task["depends_on"] = task.pop("dependencies")
                 unknown = sorted(set(task) - TASK_INPUT_FIELDS)
                 if unknown:
                     raise ValueError(f"Unsupported task field(s): {unknown}")

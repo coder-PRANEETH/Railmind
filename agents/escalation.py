@@ -212,6 +212,8 @@ class WorkItem:
     state: str = WORK_PENDING
     detail: str = "Not yet executed."
     plan_id: Optional[str] = None
+    work_order_id: Optional[str] = None
+    task_id: Optional[str] = None
     dispatched_at: Optional[float] = None
     completed_at: Optional[float] = None
 
@@ -225,6 +227,8 @@ class WorkItem:
             "state": self.state,
             "detail": self.detail,
             "plan_id": self.plan_id,
+            "work_order_id": self.work_order_id,
+            "task_id": self.task_id,
         }
 
 
@@ -232,6 +236,7 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
     """Prove or disprove one committed action against the live twin."""
     tracks = snapshot.get("tracks", {})
     trains = snapshot.get("trains", {})
+    task_completed = False
 
     def settle(state: str, detail: str) -> None:
         item.state = state
@@ -242,13 +247,36 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
         else:
             item.completed_at = None
 
+    # An accepted work order is only a promise.  When an item is tied to one,
+    # its task state gates every physical-state claim below: an already-closed
+    # failed section cannot make a just-created CLOSE_TRACK task look done.
+    if item.work_order_id and item.task_id:
+        order = next((candidate for candidate in snapshot.get("work_orders", [])
+                      if candidate.get("id") == item.work_order_id), None)
+        task = next((candidate for candidate in (order or {}).get("tasks", [])
+                     if candidate.get("id") == item.task_id), None)
+        if task is None:
+            settle(WORK_PENDING, f"Work order task {item.task_id} has not reported from the twin yet.")
+            return
+        task_status = task.get("status")
+        if task_status == "BLOCKED":
+            settle(WORK_BLOCKED, task.get("blocking_reason") or f"Task {item.task_id} is blocked.")
+            return
+        if task_status in {"UNRESOLVED", "CANCELLED"}:
+            settle(WORK_FAILED, f"Task {item.task_id} ended {task_status}.")
+            return
+        if task_status != "COMPLETED":
+            settle(WORK_PENDING, task.get("detail") or f"Task {item.task_id} is {task_status}.")
+            return
+        task_completed = True
+
     if item.kind in ("close_track", "weather_closure"):
         track = tracks.get(item.target)
         if track is None:
             settle(WORK_FAILED, f"Track {item.target} is no longer present in the twin.")
         elif is_blocking(track):
             settle(WORK_DONE, f"Track {item.target} confirmed out of service on the twin.")
-        elif item.completed_at is not None:
+        elif item.completed_at is not None or task_completed:
             # The closure was proved earlier and the twin has since restored
             # the corridor (a repair work order reopened it). Restoration is
             # the outcome the closure was for, not evidence it never happened.
@@ -276,6 +304,23 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
             settle(WORK_PENDING, f"{item.target} has not taken the alternate corridor yet.")
         return
 
+    if item.kind == "speed_restrict":
+        track = tracks.get(item.target)
+        if track is None:
+            settle(WORK_FAILED, f"Track {item.target} is no longer present in the twin.")
+        elif track.get("speed_restriction_kmh") is not None:
+            settle(WORK_DONE, f"Speed restriction on {item.target} verified on the twin.")
+        else:
+            settle(WORK_PENDING, f"No speed restriction is active on {item.target} yet.")
+        return
+
+    if item.kind == "monitor":
+        if item.target in tracks:
+            settle(WORK_DONE, f"Monitoring observation for {item.target} verified on the twin.")
+        else:
+            settle(WORK_FAILED, f"Track {item.target} is no longer present in the twin.")
+        return
+
     if item.kind == "repair_track":
         track = tracks.get(item.target)
         if track is None:
@@ -298,7 +343,7 @@ def verify_work_item(item: WorkItem, snapshot: dict, graph: nx.Graph, now: float
     if item.kind == "dispatch_crew":
         # A dispatch is proved by a crew on the section, or by the twin
         # having completed the dispatch task — never by its acceptance.
-        if _crew_on_site(item.target, snapshot):
+        if task_completed or _crew_on_site(item.target, snapshot):
             settle(WORK_DONE, f"Crew on site at {item.target}.")
         else:
             settle(WORK_PENDING, f"Crew for {item.target} is not yet on site.")
@@ -799,6 +844,8 @@ class IncidentLedger:
                 "CLOSE_TRACK": ("close_track", f"Close {target}"),
                 "REROUTE_TRAIN": ("reroute", f"Reroute {target}"),
                 "HOLD_TRAIN": ("hold", f"Hold {target} short of the failure"),
+                "SPEED_RESTRICT": ("speed_restrict", f"Restrict speed on {target}"),
+                "MONITOR": ("monitor", f"Monitor {target}"),
                 "DISPATCH_CREW": ("dispatch_crew", f"Dispatch crew to {target}"),
                 "REPAIR_TRACK": ("repair_track", f"Repair {target}"),
                 "RESTORE_SIGNAL": ("restore_signal", f"Restore signal {target}"),
@@ -807,8 +854,11 @@ class IncidentLedger:
                 continue
             kind, label = mapping[action]
             item = self._add_item(plan_id, kind, target, label, snapshot, now)
+            item.work_order_id = work_order.get("id") or work_order.get("work_order_id")
+            item.task_id = task.get("id")
             if action == "REROUTE_TRAIN":
-                item.expected_route = list(task.get("metadata", {}).get("new_route", []))
+                item.expected_route = list(task.get("params", {}).get("route", []) or
+                                           task.get("metadata", {}).get("new_route", []))
             created.append(item)
         return created
 

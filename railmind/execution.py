@@ -62,6 +62,11 @@ class TaskExecutor:
                 raise ValueError(f"Task {task.id}: unknown train {task.target}")
         elif task.target not in twin.state.tracks:
             raise ValueError(f"Task {task.id}: unknown track {task.target}")
+        if task.crew_type is not None and task.crew_type not in twin.crew_capacities:
+            raise ValueError(
+                f"Task {task.id}: unknown crew_type {task.crew_type!r}; "
+                f"expected one of {sorted(twin.crew_capacities)}"
+            )
 
     def blocking_reason(self, twin, wo: WorkOrder, task: FieldTask) -> Optional[str]:
         """Why the field cannot do this right now. Called before a task
@@ -246,6 +251,54 @@ class RerouteTrainExecutor(TaskExecutor):
         return True, f"{task.target} running {route[0]} > {route[-1]} on open corridors"
 
 
+class HoldTrainExecutor(TaskExecutor):
+    """A real operational hold, rather than the agent emitting an action
+    the twin does not recognise.  It is deliberately persistent: the order
+    proves the train is stationary, and a later routing/dispatch decision is
+    responsible for releasing it."""
+    action = TaskAction.HOLD_TRAIN
+    target_kind = "train"
+
+    def start(self, twin, wo, task):
+        train = twin.state.trains[task.target]
+        task.rollback.setdefault("manual_hold", train.manual_hold)
+        task.detail = f"Holding {task.target} at {train.current_station}"
+
+    def complete(self, twin, wo, task):
+        train = twin.state.trains[task.target]
+        train.manual_hold = True
+        train.held = True
+
+    def verify(self, twin, wo, task):
+        train = twin.state.trains[task.target]
+        if train.manual_hold and train.held:
+            return True, f"{task.target} held at {train.current_station}"
+        return False, f"{task.target} is not held"
+
+    def abort(self, twin, wo, task):
+        train = twin.state.trains[task.target]
+        train.manual_hold = bool(task.rollback.get("manual_hold", False))
+        train.held = train.manual_hold
+
+
+class MonitorExecutor(TaskExecutor):
+    """A monitored asset is an executable, verifiable operational task.
+    Monitoring makes no unsafe fictional state change; completion records a
+    real observation of the target that still exists in the twin."""
+    action = TaskAction.MONITOR
+
+    def start(self, twin, wo, task):
+        task.detail = f"Monitoring {task.target}"
+
+    def complete(self, twin, wo, task):
+        task.params["observed_tick"] = twin.sim_tick
+
+    def verify(self, twin, wo, task):
+        if task.target in twin.state.tracks and "observed_tick" in task.params:
+            return True, f"{task.target} observed at tick {task.params['observed_tick']}"
+        return False, f"{task.target} could not be observed"
+
+
 class SpeedRestrictExecutor(TaskExecutor):
     action = TaskAction.SPEED_RESTRICT
 
@@ -291,6 +344,7 @@ class DispatchCrewExecutor(TaskExecutor):
                 target=task.target,
                 work_order_id=wo.id,
                 task_id=task.id,
+                crew_type=task.crew_type or "repair",
                 dispatched_tick=twin.sim_tick,
             )
             task.rollback["crew_id"] = crew_id
@@ -432,6 +486,8 @@ EXECUTORS: Dict[TaskAction, TaskExecutor] = {
     ex.action: ex for ex in (
         CloseTrackExecutor(),
         RerouteTrainExecutor(),
+        HoldTrainExecutor(),
+        MonitorExecutor(),
         SpeedRestrictExecutor(),
         DispatchCrewExecutor(),
         RepairTrackExecutor(),
@@ -491,7 +547,8 @@ def _sibling_gate(wo: WorkOrder, task: FieldTask) -> Tuple[Optional[str], Option
         if other.id == task.id:
             continue
         if (task.action in CREW_WORK and other.action == TaskAction.DISPATCH_CREW
-                and other.target == task.target):
+                and other.target == task.target
+                and (other.crew_type or "repair") == (task.crew_type or "repair")):
             if other.status == TaskStatus.COMPLETED:
                 continue
             if other.is_terminal:
@@ -532,6 +589,24 @@ def _blocking_reason(twin, wo: WorkOrder, task: FieldTask) -> Optional[str]:
             return f"{CREW_ACCESS_BLOCKERS[condition]} to {task.target}"
 
     return executor.blocking_reason(twin, wo, task)
+
+
+def _resource_wait_reason(twin, task: FieldTask) -> Optional[str]:
+    """Return a non-terminal queue reason for a crew dispatch.
+
+    Capacity exhaustion is normal scheduling pressure, not an environmental
+    fault.  The task must therefore remain PENDING (and be reconsidered on
+    subsequent ticks) rather than becoming BLOCKED and requiring an operator
+    retry.  Crews remain allocated until their order settles or is cancelled.
+    """
+    if task.action != TaskAction.DISPATCH_CREW:
+        return None
+    crew_type = task.crew_type or "repair"
+    capacity = twin.crew_capacities.get(crew_type, 0)
+    allocated = sum(1 for crew in twin.crews.values() if crew.crew_type == crew_type)
+    if allocated >= capacity:
+        return f"Waiting for {crew_type}_crews capacity ({allocated}/{capacity} allocated)"
+    return None
 
 
 def _block(wo: WorkOrder, task: FieldTask, reason: str, tick: int) -> None:
@@ -615,6 +690,10 @@ def run_tick(twin) -> None:
                         changed = True
                         continue
                     if not wo.dependencies_met(task):
+                        continue
+                    resource_wait = _resource_wait_reason(twin, task)
+                    if resource_wait:
+                        task.detail = resource_wait
                         continue
                     wait, reason = _sibling_gate(wo, task)
                     if wait:

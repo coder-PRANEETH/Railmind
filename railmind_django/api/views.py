@@ -1,6 +1,8 @@
 import sys
 import threading
 import uuid
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add the repo root to sys.path so we can import the core railmind engine
@@ -12,10 +14,17 @@ from drf_spectacular.utils import extend_schema
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
+from django.db import transaction
+from django.db import connection
+from django.core.management import call_command
+from django.utils import timezone as django_timezone
 
 from railmind.data_loader import load_railway
 from railmind.graph import build_network_from_data
 from railmind.twin import DigitalTwin
+from .models import FieldTask as PersistedFieldTask
+from .models import WorkOrder as PersistedWorkOrder
+from .models import WorkOrderEvent as PersistedWorkOrderEvent
 
 # In-memory store for twin sessions. The default twin is built lazily on the
 # first request (never at import time) so the server always boots instantly,
@@ -25,6 +34,180 @@ twin_sessions = {}
 # mutation racing a deepcopy/dump would raise "dictionary changed size during
 # iteration" on the live state dicts.
 _twin_lock = threading.Lock()
+_persistence_lock = threading.Lock()
+_persistence_ready = False
+
+
+def _ensure_work_order_tables():
+    """Apply this app's migration lazily for the project's zero-setup mode.
+
+    Deployments should still run ``manage.py migrate`` normally.  The lazy
+    guard keeps the existing in-process demo/test client working when it is
+    started directly against a fresh SQLite file, while doing nothing once
+    the table exists.
+    """
+    global _persistence_ready
+    if _persistence_ready:
+        return
+    with _persistence_lock:
+        if _persistence_ready:
+            return
+        if PersistedWorkOrder._meta.db_table not in connection.introspection.table_names():
+            call_command("migrate", "api", interactive=False, verbosity=0)
+        _persistence_ready = True
+
+
+def _dt_from_epoch(value):
+    """Twin timestamps are epoch seconds; Django stores timezone-aware UTC."""
+    return datetime.fromtimestamp(float(value or 0), tz=timezone.utc)
+
+
+def _event_key(event):
+    raw = "|".join(str(event.get(key, "")) for key in ("tick", "kind", "task_id", "detail"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _persist_work_order(session_id, payload):
+    """Upsert the durable record after the twin accepted or advanced work.
+
+    The payload is produced by the twin, rather than trusting request input,
+    so durable progress, status and history always describe verified execution.
+    """
+    _ensure_work_order_tables()
+    with transaction.atomic():
+        record, _ = PersistedWorkOrder.objects.update_or_create(
+            work_order_id=payload["id"],
+            defaults={
+                "session_id": session_id,
+                "incident_id": payload.get("incident_id"),
+                "order_type": payload.get("type") or "CRITICAL_INCIDENT_RESPONSE",
+                "target": payload.get("target") or "",
+                "status": payload.get("status") or "UNRESOLVED",
+                "completion_percentage": int(payload.get("completion_percentage") or 0),
+                "estimated_ticks_remaining": int(payload.get("estimated_ticks_remaining") or 0),
+                "created_tick": int(payload.get("created_tick") or 0),
+                "cancelled": bool(payload.get("cancelled")),
+                "cancelled_tick": payload.get("cancelled_tick"),
+                "cancel_reason": payload.get("cancel_reason"),
+                "auto_retry": bool(payload.get("auto_retry")),
+                "created_at": _dt_from_epoch(payload.get("created_at")),
+                "metadata": {"runtime_payload_version": 1},
+            },
+        )
+        seen_task_ids = []
+        for task in payload.get("tasks") or []:
+            task_id = str(task.get("id"))
+            seen_task_ids.append(task_id)
+            PersistedFieldTask.objects.update_or_create(
+                work_order=record,
+                task_id=task_id,
+                defaults={
+                    "action": task.get("action") or "",
+                    "target": task.get("target") or "",
+                    "status": task.get("status") or "PENDING",
+                    "ticks_required": int(task.get("ticks_required") or 1),
+                    "ticks_remaining": int(task.get("ticks_remaining") or 0),
+                    "progress": float(task.get("progress") or 0.0),
+                    "dependencies": list(task.get("depends_on") or task.get("dependencies") or []),
+                    "blocking_reason": task.get("blocking_reason"),
+                    "params": dict(task.get("params") or {}),
+                    "task_metadata": dict(task.get("metadata") or {}),
+                    "crew_type": task.get("crew_type"),
+                    "detail": task.get("detail") or "",
+                    "started_tick": task.get("started_tick"),
+                    "completed_tick": task.get("completed_tick"),
+                },
+            )
+        record.field_tasks.exclude(task_id__in=seen_task_ids).delete()
+        for event in payload.get("events") or []:
+            PersistedWorkOrderEvent.objects.get_or_create(
+                work_order=record,
+                event_key=_event_key(event),
+                defaults={
+                    "tick": int(event.get("tick") or 0),
+                    "kind": event.get("kind") or "status",
+                    "task_id": event.get("task_id"),
+                    "detail": event.get("detail") or "",
+                },
+            )
+    return record
+
+
+def _twin_payload(twin, work_order_id):
+    """Use the full retained event history for persistence, not the console's
+    shortened display slice."""
+    return twin.get_work_order(work_order_id).payload(max_events=200)
+
+
+def _persist_twin_work_orders(session_id, twin):
+    _ensure_work_order_tables()
+    for work_order_id in list(twin.work_orders):
+        _persist_work_order(session_id, _twin_payload(twin, work_order_id))
+
+
+def _persisted_payload(record):
+    """Render a durable record with the same shape as a live twin payload."""
+    tasks = list(record.field_tasks.order_by("id"))
+    return {
+        "id": record.work_order_id,
+        "incident_id": record.incident_id,
+        "type": record.order_type,
+        "target": record.target,
+        "status": record.status,
+        "completion_percentage": record.completion_percentage,
+        "estimated_ticks_remaining": record.estimated_ticks_remaining,
+        "created_tick": record.created_tick,
+        "created_at": record.created_at.timestamp(),
+        "cancelled": record.cancelled,
+        "cancel_reason": record.cancel_reason,
+        "auto_retry": record.auto_retry,
+        "tasks": [{
+            "id": task.task_id,
+            "action": task.action,
+            "target": task.target,
+            "status": task.status,
+            "ticks_required": task.ticks_required,
+            "ticks_remaining": task.ticks_remaining,
+            "progress": round(task.progress, 3),
+            "depends_on": task.dependencies,
+            "dependencies": task.dependencies,
+            "blocking_reason": task.blocking_reason,
+            "params": task.params,
+            "metadata": task.task_metadata,
+            "crew_type": task.crew_type,
+            "detail": task.detail,
+            "started_tick": task.started_tick,
+            "completed_tick": task.completed_tick,
+        } for task in tasks],
+        "events": [{
+            "tick": event.tick,
+            "kind": event.kind,
+            "task_id": event.task_id,
+            "detail": event.detail,
+        } for event in record.history.all()],
+        "persisted": True,
+        "updated_at": django_timezone.localtime(record.updated_at).isoformat(),
+    }
+
+
+def _work_order_response(payload, accepted=False):
+    """Modern API contract while retaining the old nested work_order body."""
+    return {
+        "work_order_id": payload["id"],
+        "incident_id": payload.get("incident_id"),
+        "status": payload.get("status"),
+        "created_at": payload.get("created_at"),
+        "completion_percentage": payload.get("completion_percentage", 0),
+        "estimated_ticks_remaining": payload.get("estimated_ticks_remaining", 0),
+        "task_summary": {
+            "total": len(payload.get("tasks") or []),
+            "by_status": {
+                task_status: sum(1 for task in payload.get("tasks") or [] if task.get("status") == task_status)
+                for task_status in ("PENDING", "IN_PROGRESS", "COMPLETED", "BLOCKED", "UNRESOLVED", "CANCELLED")
+            },
+        },
+        "work_order": payload,
+    }
 
 # Sandbox sessions kept at most (oldest evicted first); the default twin is never evicted.
 MAX_SANDBOX_SESSIONS = 16
@@ -102,6 +285,7 @@ def get_state(request):
             return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
 
         twin.maybe_tick()
+        _persist_twin_work_orders(_session_id(request), twin)
         state_dump = twin.get_state()
 
         graph_state = {
@@ -128,9 +312,13 @@ def reset_twin(request):
 
     Clears all sandbox sessions. Handy between demo runs.
     """
+    _ensure_work_order_tables()
     with _twin_lock:
         twin_sessions.clear()
         twin_sessions["default"] = _build_default_twin()
+    # Reset is an explicit new scenario, so its durable execution history is
+    # intentionally cleared too. Ordinary process restarts do not do this.
+    PersistedWorkOrder.objects.all().delete()
     return Response({"status": "success", "message": "Digital twin reset to baseline state."})
 
 
@@ -445,6 +633,7 @@ def advance_twin(request):
 
         sim_tick = twin.advance_ticks(ticks)
         work_orders = twin.work_orders_payload()
+        _persist_twin_work_orders(_session_id(request), twin)
     return Response({"status": "success", "ticks": ticks, "sim_tick": sim_tick, "work_orders": work_orders})
 
 
@@ -481,12 +670,25 @@ def work_orders(request):
     `restored_health` (REPAIR_TRACK). Optional `auto_retry` on the order.
     """
     if request.method == 'GET':
+        _ensure_work_order_tables()
         with _twin_lock:
             twin = _resolve_twin(_session_id(request))
             if not twin:
                 return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
+            twin.maybe_tick()
+            _persist_twin_work_orders(_session_id(request), twin)
             payload = twin.work_orders_payload()
             sim_tick = twin.sim_tick
+        # The live twin wins if present. Orders from before a process restart
+        # remain retrievable from the database even though no in-memory twin
+        # has yet rehydrated them.
+        live_ids = {order["id"] for order in payload}
+        persisted = [
+            _persisted_payload(record)
+            for record in PersistedWorkOrder.objects.filter(session_id=_session_id(request))
+            if record.work_order_id not in live_ids
+        ]
+        payload.extend(persisted)
         return Response({"sim_tick": sim_tick, "work_orders": payload})
 
     body, error = _json_object(request)
@@ -531,6 +733,8 @@ def work_orders(request):
                     track_id, incident_id=incident_id, work_order_id=body.get("id") or None
                 )
             else:
+                if body.get("work_order_id") and not body.get("id"):
+                    body["id"] = body["work_order_id"]
                 wo = twin.register_work_order({
                     "id": body.get("id") or None,
                     "incident_id": incident_id,
@@ -540,6 +744,7 @@ def work_orders(request):
                     "auto_retry": bool(body.get("auto_retry", False)),
                 })
             payload = wo.payload()
+            _persist_work_order(_session_id(request), _twin_payload(twin, wo.id))
     except ValueError as e:
         # Covers pydantic validation errors too (a ValueError subclass)
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -555,14 +760,23 @@ def work_order_detail(request, work_order_id):
     completion percentage, ETA in ticks, every task with its progress and
     blocking reason, and the most recent execution events.
     """
+    _ensure_work_order_tables()
     with _twin_lock:
         twin = _resolve_twin(_session_id(request))
         if not twin:
             return Response({"error": "Invalid session"}, status=status.HTTP_404_NOT_FOUND)
         try:
+            twin.maybe_tick()
             payload = twin.work_order_payload(work_order_id)
+            _persist_work_order(_session_id(request), _twin_payload(twin, work_order_id))
         except KeyError:
-            return Response({"error": f"Work order '{work_order_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+            try:
+                record = PersistedWorkOrder.objects.get(
+                    work_order_id=work_order_id, session_id=_session_id(request)
+                )
+            except PersistedWorkOrder.DoesNotExist:
+                return Response({"error": f"Work order '{work_order_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
+            payload = _persisted_payload(record)
         sim_tick = twin.sim_tick
     return Response({"sim_tick": sim_tick, "work_order": payload})
 
@@ -592,6 +806,7 @@ def work_order_cancel(request, work_order_id):
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         payload = wo.payload()
+        _persist_work_order(_session_id(request), _twin_payload(twin, wo.id))
     return Response({"status": "success", "work_order": payload})
 
 
@@ -620,4 +835,46 @@ def work_order_retry(request, work_order_id):
             return Response({"error": f"Work order '{work_order_id}' not found"}, status=status.HTTP_404_NOT_FOUND)
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        _persist_work_order(_session_id(request), _twin_payload(twin, work_order_id))
     return Response({"status": "success", "retried": retried, "work_order": payload})
+
+
+# ---------------------------------------------------------------------------
+# Modern hyphenated API contract.  The original /workorders/ routes above
+# remain untouched for the console and existing integrations.  These aliases
+# deliberately return 202 on creation: accepting field work is not claiming
+# it completed; polling this resource or advancing the controlled tick loop
+# reveals the actual execution state.
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+def work_orders_modern(request):
+    legacy = work_orders(request)
+    if legacy.status_code >= status.HTTP_400_BAD_REQUEST:
+        return legacy
+    if request.method == 'GET':
+        return Response({"work_orders": legacy.data.get("work_orders", []),
+                         "sim_tick": legacy.data.get("sim_tick", 0)})
+    payload = legacy.data["work_order"]
+    return Response(_work_order_response(payload, accepted=True), status=status.HTTP_202_ACCEPTED)
+
+
+@api_view(['GET'])
+def work_order_detail_modern(request, work_order_id):
+    legacy = work_order_detail(request, work_order_id)
+    if legacy.status_code >= status.HTTP_400_BAD_REQUEST:
+        return legacy
+    payload = legacy.data["work_order"]
+    body = _work_order_response(payload)
+    body["sim_tick"] = legacy.data.get("sim_tick", 0)
+    return Response(body)
+
+
+@api_view(['POST'])
+def work_order_cancel_modern(request, work_order_id):
+    legacy = work_order_cancel(request, work_order_id)
+    if legacy.status_code >= status.HTTP_400_BAD_REQUEST:
+        return legacy
+    body = _work_order_response(legacy.data["work_order"])
+    body["status"] = "CANCELLED"
+    return Response(body)

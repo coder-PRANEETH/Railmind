@@ -1,123 +1,159 @@
-"""Deterministic WorkOrder construction for the RailMind agent pipeline.
+"""Deterministic, twin-compatible WorkOrder construction.
 
-The agent decides *what* work should be committed. The backend owns execution and
-verification. This module only turns a selected plan into a transport-safe,
-ordered execution object.
+The planner may reason in strategy IDs, but the object crossing the
+Agent → Backend boundary must be accepted unchanged by
+``DigitalTwin.register_work_order``.  This module intentionally contains no
+execution status: the twin is the only component allowed to add progress or
+claim that a task completed.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
 import time
 import uuid
+from typing import Any, Dict, Iterable, List, Optional
 
 
 ACTION_DURATION = {
-    "CLOSE_TRACK": 0,
+    "CLOSE_TRACK": 1,
     "REROUTE_TRAIN": 2,
+    "HOLD_TRAIN": 1,
+    "SPEED_RESTRICT": 1,
+    "MONITOR": 1,
     "DISPATCH_CREW": 10,
     "REPAIR_TRACK": 20,
-    "RESTORE_SIGNAL": 10,
-    "SPEED_RESTRICT": 0,
-    "MONITOR": 0,
+    "RESTORE_SIGNAL": 8,
 }
 
 
-def _task(task_id: str, action: str, target: str, *, estimated_ticks: int = 0,
-          depends_on: Optional[List[str]] = None, crew_type: Optional[str] = None,
-          metadata: Optional[Dict[str, Any]] = None) -> dict:
+def _task(task_id: str, action: str, target: str, *, ticks_required: Optional[int] = None,
+          depends_on: Optional[Iterable[str]] = None, params: Optional[Dict[str, Any]] = None,
+          crew_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> dict:
+    """Return the public DigitalTwin task schema.
+
+    ``depends_on`` remains the canonical API spelling to preserve the live
+    twin API. The twin also accepts ``dependencies`` on input and exposes
+    both spellings on read, allowing integrations to migrate gradually.
+    """
     return {
         "id": task_id,
         "action": action,
         "target": target,
-        "estimated_ticks": int(estimated_ticks),
+        "ticks_required": int(ticks_required or ACTION_DURATION[action]),
         "depends_on": list(depends_on or []),
+        "params": dict(params or {}),
         "crew_type": crew_type,
-        "status": "PENDING",
-        "metadata": metadata or {},
+        "metadata": dict(metadata or {}),
     }
+
+
+def _append(tasks: List[dict], action: str, target: str, **kwargs: Any) -> str:
+    task_id = f"task_{len(tasks) + 1}"
+    tasks.append(_task(task_id, action, target, **kwargs))
+    return task_id
+
+
+def _add_unique(tasks: List[dict], action: str, target: str, **kwargs: Any) -> Optional[str]:
+    """Add one operational task per action/target pair and return its id."""
+    for task in tasks:
+        if task["action"] == action and task["target"] == target:
+            return task["id"]
+    return _append(tasks, action, target, **kwargs)
 
 
 def build_work_order(plan: dict, *, incident_id: Optional[str] = None,
                      field_requirements: Optional[List[dict]] = None,
                      resources: Optional[dict] = None) -> dict:
-    """Convert selected plan actions + deterministic field requirements to a WorkOrder."""
-    resources = resources or {"repair_crews": 2, "signal_crews": 1}
+    """Convert a selected A/B/C plan into one executable WorkOrder proposal.
+
+    No legacy ``estimated_ticks``, status, or free-form action is emitted:
+    every task is a valid ``TaskAction`` and can be posted directly to the
+    Django twin endpoint. Resource information remains as audit metadata;
+    the live twin enforces allocation when a dispatch task starts.
+    """
+    resources = dict(resources or {"repair_crews": 2, "signal_crews": 1})
     tasks: List[dict] = []
     close_tasks: Dict[str, str] = {}
-    dispatch_tasks: Dict[str, str] = {}
 
-    for action in plan.get("actions", []):
-        if not isinstance(action, dict):
+    for strategy in plan.get("actions", []):
+        if not isinstance(strategy, dict):
             continue
-        sid = action.get("strategy_id", "")
+        sid = str(strategy.get("strategy_id", ""))
+        target = strategy.get("track_id")
         if sid.startswith("T_CLOSE_"):
-            target = action.get("track_id") or sid.removeprefix("T_CLOSE_")
-            tid = f"task_{len(tasks)+1}"
-            tasks.append(_task(tid, "CLOSE_TRACK", target))
-            close_tasks[target] = tid
-        elif sid.startswith("R_REROUTE_"):
-            target = action.get("train_id", "")
-            tid = f"task_{len(tasks)+1}"
-            tasks.append(_task(tid, "REROUTE_TRAIN", target, estimated_ticks=2,
-                               metadata={"new_route": action.get("new_route", [])}))
-        elif sid.startswith("R_HOLD_"):
-            target = action.get("train_id", "")
-            tid = f"task_{len(tasks)+1}"
-            tasks.append(_task(tid, "HOLD_TRAIN", target, estimated_ticks=1))
+            target = target or sid.removeprefix("T_CLOSE_")
+            if target:
+                close_tasks[target] = _add_unique(tasks, "CLOSE_TRACK", target) or ""
+        elif sid.startswith("T_RESTRICT_") and target:
+            _add_unique(tasks, "SPEED_RESTRICT", target, params={"speed_kmh": 60})
+        elif sid.startswith("T_MONITOR_") and target:
+            _add_unique(tasks, "MONITOR", target)
+        elif sid.startswith("R_REROUTE_") and strategy.get("train_id"):
+            _add_unique(tasks, "REROUTE_TRAIN", strategy["train_id"],
+                        params={"route": list(strategy.get("new_route") or [])})
+        elif sid.startswith("R_HOLD_") and strategy.get("train_id"):
+            _add_unique(tasks, "HOLD_TRAIN", strategy["train_id"])
+        elif sid.startswith("W"):
+            for operational_action in strategy.get("actions", []):
+                if operational_action.startswith("close_track_"):
+                    weather_target = operational_action.removeprefix("close_track_").split("+")[0]
+                    if weather_target:
+                        close_tasks[weather_target] = _add_unique(
+                            tasks, "CLOSE_TRACK", weather_target
+                        ) or ""
+                elif operational_action.startswith("reduce_speed_40kmh_"):
+                    weather_target = operational_action.removeprefix("reduce_speed_40kmh_")
+                    _add_unique(tasks, "SPEED_RESTRICT", weather_target, params={"speed_kmh": 40})
+                elif operational_action.startswith("reduce_speed_60kmh_"):
+                    weather_target = operational_action.removeprefix("reduce_speed_60kmh_")
+                    _add_unique(tasks, "SPEED_RESTRICT", weather_target, params={"speed_kmh": 60})
 
-    # Field requirements are intentionally separate from operational actions.
-    # They are not inferred from LLM text; they come from specialist agents.
-    for req in field_requirements or []:
-        if not req.get("required"):
+    # Required physical interventions get a capacity-accounted crew dispatch
+    # and an explicit dependency chain. This is not inferred from prose.
+    for requirement in field_requirements or []:
+        if not requirement.get("required"):
             continue
-        target = req.get("target") or req.get("track") or req.get("signal")
-        action = req.get("action")
-        if not target or not action:
+        target = requirement.get("target") or requirement.get("track") or requirement.get("signal")
+        action = str(requirement.get("action", "")).upper()
+        if not target or action not in {"REPAIR_TRACK", "RESTORE_SIGNAL"}:
             continue
-        action = str(action).upper()
-        if action == "REPAIR_TRACK":
-            close_dep = close_tasks.get(target)
-            dispatch_id = f"task_{len(tasks)+1}"
-            deps = [close_dep] if close_dep else []
-            tasks.append(_task(dispatch_id, "DISPATCH_CREW", target,
-                               estimated_ticks=10, depends_on=deps,
-                               crew_type="repair",
-                               metadata={"resource_pool": "repair_crews"}))
-            dispatch_tasks[target] = dispatch_id
-            repair_id = f"task_{len(tasks)+1}"
-            tasks.append(_task(repair_id, "REPAIR_TRACK", target,
-                               estimated_ticks=int(req.get("estimated_ticks", 20)),
-                               depends_on=[dispatch_id], crew_type="repair",
-                               metadata={"resource_pool": "repair_crews"}))
-        elif action == "RESTORE_SIGNAL":
-            deps = [close_tasks[target]] if target in close_tasks else []
-            tasks.append(_task(f"task_{len(tasks)+1}", "RESTORE_SIGNAL", target,
-                               estimated_ticks=int(req.get("estimated_ticks", 10)),
-                               depends_on=deps, crew_type="signal",
-                               metadata={"resource_pool": "signal_crews"}))
+        crew_type = "repair" if action == "REPAIR_TRACK" else "signal"
+        pool = f"{crew_type}_crews"
+        prior = [close_tasks[target]] if close_tasks.get(target) else []
+        dispatch_id = _append(
+            tasks, "DISPATCH_CREW", target, depends_on=prior, crew_type=crew_type,
+            metadata={"resource_pool": pool},
+        )
+        _append(
+            tasks, action, target,
+            ticks_required=int(requirement.get("estimated_ticks") or ACTION_DURATION[action]),
+            depends_on=[dispatch_id], crew_type=crew_type,
+            metadata={"resource_pool": pool, "requirement": dict(requirement)},
+        )
 
-    # Safety ordering: operational reroutes and field work occur only after
-    # the plan's closure actions have been committed. This is intentionally
-    # conservative; the backend enforces these dependencies.
-    close_ids = list(close_tasks.values())
+    # Reroutes and holds wait for planned closures, maintaining a safe order
+    # without serialising unrelated field work.
+    close_ids = [task_id for task_id in close_tasks.values() if task_id]
     for task in tasks:
-        if task["action"] in ("REROUTE_TRAIN", "RESTORE_SIGNAL"):
-            for close_id in close_ids:
-                if close_id != task["id"] and close_id not in task["depends_on"]:
-                    task["depends_on"].append(close_id)
+        if task["action"] in {"REROUTE_TRAIN", "HOLD_TRAIN"}:
+            task["depends_on"] = list(dict.fromkeys(task["depends_on"] + close_ids))
 
     work_order_id = f"WO-{uuid.uuid4().hex[:8].upper()}"
     return {
+        # ``id`` is authoritative for the DigitalTwin / Django API;
+        # ``work_order_id`` remains for the current console response shape.
+        "id": work_order_id,
         "work_order_id": work_order_id,
-        "type": "CRITICAL_INCIDENT_RESPONSE",
         "incident_id": incident_id,
-        "plan_id": plan.get("plan_id"),
-        "priority": plan.get("priority", "HIGH"),
-        "status": "PENDING",
-        "created_at": time.time(),
-        "resources": resources,
+        "type": "CRITICAL_INCIDENT_RESPONSE",
+        "target": next((t["target"] for t in tasks if t["action"] in {"CLOSE_TRACK", "REPAIR_TRACK"}),
+                       (tasks[0]["target"] if tasks else "NETWORK")),
         "tasks": tasks,
+        "auto_retry": False,
+        "priority": plan.get("priority", "HIGH"),
+        "plan_id": plan.get("plan_id"),
+        "resources": resources,
         "ettr_ticks": int(plan.get("ettr_ticks", 0)),
+        "created_at": time.time(),
         "source": "RailMind Master Agent",
+        "status": "PROPOSED",
     }

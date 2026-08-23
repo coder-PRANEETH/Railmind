@@ -1,7 +1,7 @@
 // Canonical RailMind network — mirrors railmind/data/india_network.json in the
 // Python backend, so station/track IDs line up across the whole stack.
 
-export type Station = { id: string; name: string; lat: number; lon: number; x: number; y: number };
+export type Station = { id: string; name: string; lat: number; lon: number; x: number; y: number; position: [number, number] };
 export type Track = {
   id: string;
   from: string;
@@ -64,6 +64,7 @@ export const STATIONS: Station[] = RAW_STATIONS.map((s) => ({
   ...s,
   x: Math.round(PAD_X + ((s.lon - lonMin) / (lonMax - lonMin)) * (VIEW_W - 2 * PAD_X)),
   y: Math.round(PAD_TOP + ((latMax - s.lat) / (latMax - latMin)) * (VIEW_H - PAD_TOP - PAD_BOTTOM)),
+  position: [s.lat, s.lon],
 }));
 
 const STATION_BY_ID = Object.fromEntries(STATIONS.map((s) => [s.id, s]));

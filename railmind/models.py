@@ -51,6 +51,11 @@ class TrainState(BaseModel):
     route_index: int = 0        # position of current_station within route
     progress: float = 0.0       # 0..1 along the edge to the next station
     held: bool = False          # true while blocked by a closed track ahead
+    # A HOLD_TRAIN work-order task sets this separately from ``held``.  The
+    # latter is recalculated by every movement tick, while this flag records
+    # an operator's deliberate stop and keeps the train stopped until a
+    # later operational decision releases it.
+    manual_hold: bool = False
 
 class StationNode(BaseModel):
     station_id: str

@@ -20,6 +20,8 @@ class TaskAction(str, Enum):
     DISPATCH_CREW = "DISPATCH_CREW"
     REPAIR_TRACK = "REPAIR_TRACK"
     RESTORE_SIGNAL = "RESTORE_SIGNAL"
+    HOLD_TRAIN = "HOLD_TRAIN"
+    MONITOR = "MONITOR"
 
 
 class TaskStatus(str, Enum):
@@ -75,6 +77,8 @@ DEFAULT_TICKS_REQUIRED: Dict[TaskAction, int] = {
     TaskAction.DISPATCH_CREW: 10,
     TaskAction.REPAIR_TRACK: 20,
     TaskAction.RESTORE_SIGNAL: 8,
+    TaskAction.HOLD_TRAIN: 1,
+    TaskAction.MONITOR: 1,
 }
 
 # Actions that rewrite a track's status. Two of them cannot work the same
@@ -99,7 +103,10 @@ MAX_EVENTS = 200
 # models (status, ticks_remaining, rollback, events, ...) is the engine's
 # record of what the railway actually did, and is never taken from input.
 ORDER_INPUT_FIELDS = frozenset({"id", "incident_id", "type", "target", "tasks", "auto_retry"})
-TASK_INPUT_FIELDS = frozenset({"id", "action", "target", "ticks_required", "depends_on", "params"})
+TASK_INPUT_FIELDS = frozenset({
+    "id", "action", "target", "ticks_required", "depends_on", "dependencies",
+    "params", "crew_type", "metadata",
+})
 ENGINE_PARAMS = frozenset({"crew_id", "resolved_route", "resolved_destination", "arrived"})
 
 
@@ -109,6 +116,7 @@ class CrewUnit(BaseModel):
     status: CrewStatus = CrewStatus.EN_ROUTE
     work_order_id: str
     task_id: str
+    crew_type: str = "repair"
     dispatched_tick: int
     arrived_tick: Optional[int] = None
 
@@ -119,6 +127,7 @@ class CrewUnit(BaseModel):
             "status": self.status.value,
             "work_order_id": self.work_order_id,
             "task_id": self.task_id,
+            "crew_type": self.crew_type,
             "dispatched_tick": self.dispatched_tick,
             "arrived_tick": self.arrived_tick,
         }
@@ -132,6 +141,11 @@ class FieldTask(BaseModel):
     ticks_required: Optional[int] = Field(default=None, ge=1, le=MAX_TICKS_REQUIRED)
     ticks_remaining: Optional[int] = Field(default=None, ge=0)
     depends_on: List[str] = Field(default_factory=list)
+    # Kept alongside ``depends_on`` because it is useful to both the planner
+    # and persistence layer.  The public API also accepts ``dependencies``
+    # and normalises it before model construction for backwards compatibility.
+    crew_type: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     blocking_reason: Optional[str] = None
     params: Dict[str, Any] = Field(default_factory=dict)
     detail: str = "Not yet started."
@@ -205,6 +219,9 @@ class FieldTask(BaseModel):
             "ticks_remaining": self.ticks_remaining,
             "progress": round(self.progress, 3),
             "depends_on": list(self.depends_on),
+            "dependencies": list(self.depends_on),
+            "crew_type": self.crew_type,
+            "metadata": dict(self.metadata),
             "blocking_reason": self.blocking_reason,
             "detail": self.detail,
             "started_tick": self.started_tick,
@@ -270,8 +287,10 @@ class WorkOrder(BaseModel):
         deps = {t.id: list(t.depends_on) for t in self.tasks}
         for task in self.tasks:
             if task.action in CREW_WORK:
+                crew_type = task.crew_type or "repair"
                 for other in self.tasks:
                     if (other.action == TaskAction.DISPATCH_CREW and other.target == task.target
+                            and (other.crew_type or "repair") == crew_type
                             and other.id not in deps[task.id]):
                         deps[task.id].append(other.id)
         colour: Dict[str, str] = {}
@@ -386,6 +405,7 @@ class WorkOrder(BaseModel):
             "completion_percentage": self.completion_percentage,
             "estimated_ticks_remaining": self.estimated_ticks_remaining(),
             "created_tick": self.created_tick,
+            "created_at": self.created_at,
             "cancelled": self.cancelled,
             "cancel_reason": self.cancel_reason,
             "auto_retry": self.auto_retry,

@@ -883,6 +883,74 @@ def planner_node(state: RailState) -> RailState:
 # Outputs: { plan_id, delay, risk, passenger_impact, congestion }
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _clone_simulate_plan(plan: dict, snapshot: dict) -> dict:
+    """Play a candidate WorkOrder forward on an isolated DigitalTwin clone.
+
+    This is deliberately separate from the scoring heuristics below: the
+    clone is the executable feasibility check. It registers the *same* task
+    schema the backend will receive, advances dependencies/weather/resource
+    scheduling, and reports residual work from physical verification.
+    """
+    from railmind.data_loader import load_railway
+    from railmind.graph import build_network_from_data
+    from railmind.models import NetworkState
+    from railmind.twin import DigitalTwin
+
+    stations, tracks = load_railway("India")
+    future = DigitalTwin(build_network_from_data(stations, tracks))
+    resources = plan.get("field_resources") or {}
+    future.crew_capacities.update({
+        "repair": max(0, int(resources.get("repair_crews", future.crew_capacities["repair"]))),
+        "signal": max(0, int(resources.get("signal_crews", future.crew_capacities["signal"]))),
+    })
+    future.state = NetworkState.model_validate({
+        "weather": snapshot.get("weather", {}),
+        "tracks": snapshot.get("tracks", {}),
+        "trains": snapshot.get("trains", {}),
+        "stations": snapshot.get("stations", {}),
+        "timestamp": snapshot.get("timestamp", time.time()),
+    })
+    # The graph is a second, routing-specific view of the physical tracks.
+    # Set it from the snapshot so reroutes in the clone see the same closures.
+    for track in future.state.tracks.values():
+        future.graph.set_track_status(track.track_id, track.status, track.health)
+    future.ambient_weather = False
+
+    proposal = build_work_order(
+        plan,
+        field_requirements=[] if plan.get("deferred_work") else plan.get("field_requirements", []),
+        resources=plan.get("field_resources"),
+    )
+    work_order = None
+    if proposal["tasks"]:
+        work_order = future.register_work_order({
+            key: proposal[key] for key in ("id", "incident_id", "type", "target", "tasks", "auto_retry")
+        })
+        # Let a complete normal response reach verification, while capping
+        # the forecast to keep the three-plan comparison responsive.
+        future.advance_ticks(min(100, max(1, work_order.estimated_ticks_remaining() + 4)))
+
+    congestion = (
+        sum(station.congestion_level for station in future.state.stations.values()) /
+        max(1, len(future.state.stations))
+    )
+    held = [train for train in future.state.trains.values() if train.held]
+    order_payload = work_order.payload(max_events=200) if work_order else None
+    unresolved = [
+        task for task in (order_payload or {}).get("tasks", [])
+        if task["status"] != "COMPLETED"
+    ]
+    return {
+        "delay": round(future.calculate_delay(), 2),
+        "risk": round(future.calculate_risk(), 3),
+        "passenger_impact": sum(train.passengers for train in held),
+        "congestion": round(congestion, 3),
+        "ettr_ticks": (order_payload or {}).get("estimated_ticks_remaining", 0),
+        "residual_unresolved_work": len(unresolved),
+        "work_order_status": (order_payload or {}).get("status", "COMPLETE"),
+        "task_statuses": [task["status"] for task in (order_payload or {}).get("tasks", [])],
+    }
+
 def _simulate_plan(plan: dict, snapshot: dict) -> dict:
     delay = 0
     risk = 0.25
@@ -1044,16 +1112,34 @@ def _simulate_plan(plan: dict, snapshot: dict) -> dict:
     risk = max(0.0, min(1.0, risk))
     congestion = round(min(congestion, 1.0), 2)
 
+    # A clone-backed execution forecast is an additional source of score
+    # input, not an optional visualisation. Keep the established doctrine
+    # penalties (especially weather exposure) and blend in what the actual
+    # task engine says can progress/verify in a future timeline.
+    try:
+        clone = _clone_simulate_plan(plan, snapshot)
+    except Exception as exc:
+        # The rule score remains a safe fallback for malformed external
+        # snapshots; the diagnostic makes the degraded simulation explicit.
+        clone = {"simulation_error": str(exc), "delay": 0, "risk": 0,
+                 "passenger_impact": 0, "congestion": 0,
+                 "ettr_ticks": ettr, "residual_unresolved_work": field_tasks,
+                 "work_order_status": "UNRESOLVED", "task_statuses": []}
+
     return {
         "plan_id": plan["plan_id"],
         "plan_name": plan["plan_name"],
-        "delay": delay,
-        "risk": round(risk, 2),
-        "passenger_impact": passenger_impact,
-        "congestion": congestion,
-        "ettr_ticks": ettr,
+        "delay": round(delay + clone["delay"], 2),
+        "risk": round(max(risk, clone["risk"]), 2),
+        "passenger_impact": max(passenger_impact, clone["passenger_impact"]),
+        "congestion": round(max(congestion, clone["congestion"]), 2),
+        "ettr_ticks": max(ettr, int(clone["ettr_ticks"] or 0)),
         "field_tasks": field_tasks,
         "deferred_work": list(plan.get("deferred_work", [])),
+        "residual_unresolved_work": clone["residual_unresolved_work"],
+        "clone_work_order_status": clone["work_order_status"],
+        "clone_task_statuses": clone["task_statuses"],
+        "clone_simulation_error": clone.get("simulation_error"),
     }
 
 
@@ -1452,12 +1538,6 @@ def _format_response(final: RailState, twin_source: str, use_llm: bool = True) -
 # only thing that ever marks them complete.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Tasks the twin executes as field work; everything else in a proposal is an
-# operational action /apply-plan performs directly, or a hold the ledger
-# verifies on the train.
-FIELD_ACTIONS = ("DISPATCH_CREW", "REPAIR_TRACK", "RESTORE_SIGNAL")
-
-
 def _submit_work_order(work_order: dict, source: str) -> dict:
     """Stamp a proposed WorkOrder for the console. Nothing is executed or
     accepted here — that happens when the operator applies the plan."""
@@ -1466,76 +1546,47 @@ def _submit_work_order(work_order: dict, source: str) -> dict:
     return {**work_order, "status": "PROPOSED", "backend": source or "embedded"}
 
 
-def _twin_task(task: dict, field_ids: set) -> dict:
-    """A proposal task in the twin's registration format. Dependencies on
-    operational tasks are dropped: those actions have already landed."""
-    spec = {
-        "id": task["id"],
-        "action": task["action"],
-        "target": task["target"],
-        "depends_on": [d for d in task.get("depends_on", []) if d in field_ids],
-    }
-    ticks = int(task.get("estimated_ticks") or 0)
-    if ticks > 0:
-        spec["ticks_required"] = ticks
-    return spec
-
-
 def _dispatch_field_work(plan: dict, work_order: dict, graded: dict) -> tuple[list, list]:
-    """Hand the proposal's field tasks to the twin, one order per section,
-    unless field work is already live there.
+    """Accept the approved proposal as one executable twin work order.
 
-    A plan that defers physical work by doctrine (Minimal Intervention)
-    registers nothing. A proposal without field tasks falls back to the
-    twin's standard response for every failed section the plan closed.
-    Returns (orders registered, problems); a problem never fails the apply —
-    the operational actions are already on the twin and the ledger has the
-    work items — the log says which repair could not be ordered."""
+    The previous path applied closures/reroutes synchronously and handed only
+    repair tasks to the twin. That made acceptance look like completion and
+    left two task schemas in circulation. Every action now enters the same
+    tick-driven engine and the response merely confirms it was accepted.
+    """
     if plan.get("deferred_work"):
         return [], []
-
-    groups: dict = {}
-    for task in work_order.get("tasks", []):
-        if isinstance(task, dict) and task.get("action") in FIELD_ACTIONS and task.get("target"):
-            groups.setdefault(task["target"], []).append(task)
-    if not groups:
-        for action in plan.get("actions", []):
-            if isinstance(action, dict) and action.get("strategy_id", "").startswith("T_CLOSE_"):
-                groups.setdefault(action["track_id"], [])
-    if not groups:
+    tasks = [task for task in work_order.get("tasks", []) if isinstance(task, dict)]
+    if not tasks:
         return [], []
 
     try:
         live = _twin_work_orders()
     except (requests.RequestException, HTTPException) as e:
         return [], [f"could not list work orders: {getattr(e, 'detail', e)}"]
+    work_order_id = work_order.get("id") or work_order.get("work_order_id")
+    if any(order.get("id") == work_order_id for order in live):
+        return [], []
     busy = {o.get("target") for o in live if o.get("status") in esc.FIELD_WORK_LIVE}
     incident_by_track = {
         i["track_id"]: i["id"] for i in graded.get("incidents", []) if not i.get("closed")
     }
-
-    registered, problems = [], []
-    base_id = work_order.get("work_order_id")
-    for n, (track_id, tasks) in enumerate(groups.items()):
-        if track_id in busy:
-            continue
-        order_id = (base_id if n == 0 else f"{base_id}-{n}") if base_id else None
-        incident_id = incident_by_track.get(track_id)
-        try:
-            if tasks:
-                field_ids = {t["id"] for t in tasks}
-                registered.append(_twin_register_work_order({
-                    "id": order_id,
-                    "incident_id": incident_id,
-                    "type": work_order.get("type") or "CRITICAL_INCIDENT_RESPONSE",
-                    "target": track_id,
-                    "tasks": [_twin_task(t, field_ids) for t in tasks],
-                }))
-            else:
-                registered.append(_twin_register_incident_response(track_id, incident_id, order_id))
-        except (requests.RequestException, HTTPException) as e:
-            problems.append(f"{track_id}: {getattr(e, 'detail', e)}")
-    return registered, problems
+    target = work_order.get("target") or tasks[0].get("target")
+    if target in busy:
+        return [], [f"{target}: another live work order already owns this target"]
+    incident_id = work_order.get("incident_id") or incident_by_track.get(target)
+    try:
+        registered = _twin_register_work_order({
+            "id": work_order_id,
+            "incident_id": incident_id,
+            "type": work_order.get("type") or "CRITICAL_INCIDENT_RESPONSE",
+            "target": target,
+            "tasks": tasks,
+            "auto_retry": bool(work_order.get("auto_retry", False)),
+        })
+    except (requests.RequestException, HTTPException) as e:
+        return [], [f"{target}: {getattr(e, 'detail', e)}"]
+    return [registered], []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1931,16 +1982,13 @@ def simulate_weather(track_id: str, condition: str = "STORM"):
             **_format_response(final, source)}
 
 
-@app.post("/apply-plan")
+@app.post("/apply-plan", status_code=202)
 def apply_plan(plan_id: str | None = None):
-    """Close the loop: execute the chosen plan on the twin.
+    """Accept the operator-approved plan for asynchronous twin execution.
 
-    Uses the plans from the last pipeline run shown to the console, so the
-    operator executes exactly what they approved even though the twin has
-    ticked since; recomputes only when no recent run exists. Closes flagged
-    tracks and applies the plan's reroutes so the living twin reflects the
-    decision — trains follow their new routes on subsequent ticks.
-    Defaults to the Master Agent's recommended plan.
+    The method intentionally returns before a task starts. The client polls
+    the work order (or drives the controlled tick endpoint) to learn whether
+    it is still pending, progressing, blocked, or physically complete.
     """
     # Read the cached run into locals ONCE: a concurrent /reset nulls the
     # shared dict, so a check-then-reread would crash (or worse, mix runs)
@@ -1962,97 +2010,49 @@ def apply_plan(plan_id: str | None = None):
     if plan is None:
         raise HTTPException(status_code=404, detail=f"Plan '{target_id}' not found.")
 
-    applied = []
-    apply_error = None
-    try:
-        for action in plan["actions"]:
-            if not isinstance(action, dict):
-                continue
-            sid = action.get("strategy_id", "")
-            if sid.startswith("T_CLOSE_"):
-                _twin_close_track(action["track_id"])
-                applied.append(f"Closed track {action['track_id']}")
-            elif sid.startswith("R_REROUTE_"):
-                _twin_reroute_train(action["train_id"], action["new_route"])
-                applied.append(f"Rerouted {action['train_id']}")
-            elif sid.startswith("W"):
-                # Weather protocols advertise closures inside action strings
-                # like "close_track_T05+reroute_all_trains" — execute them.
-                for act in action.get("actions", []):
-                    if act.startswith("close_track_"):
-                        track_id = act.removeprefix("close_track_").split("+")[0]
-                        _twin_close_track(track_id)
-                        applied.append(f"Closed track {track_id} (weather protocol {sid})")
-    except requests.RequestException as e:
-        # Actions already applied changed the twin — a 502 here would hide
-        # them, so report the partial execution instead.
-        apply_error = e
-
-    if apply_error is None:
-        message = f"Plan {target_id} executed on the live twin: {len(applied)} action(s)"
-    else:
-        message = (f"Plan {target_id} partially executed: {len(applied)} action(s) "
-                   f"applied before the twin became unreachable: {apply_error}")
-    final["log"].append({
-        "t": time.strftime("%H:%M:%S"),
-        "source": "Executor",
-        "message": message,
-    })
-
-    # The WorkOrder for the plan actually approved — the cached proposal
-    # describes the recommended plan, which need not be this one. Minimal
-    # Intervention defers physical work, so its proposal carries none.
+    # The cached proposal may describe a different recommendation, so build
+    # the transport object for the operator's actual selected A/B/C plan.
     work_order = build_work_order(
         plan,
         field_requirements=[] if plan.get("deferred_work") else final.get("field_requirements", []),
         resources=final.get("field_resources", {"repair_crews": 2, "signal_crews": 1}),
     )
 
-    # Register what this plan committed to, then re-grade against a FRESH
-    # snapshot. Registering every action — not just the ones the apply loop
-    # reported — is the point: an action that never landed must show as
-    # outstanding work, not vanish from the checklist. Field tasks become
-    # work items too, proved against the twin like everything else.
+    # Attribute the order before accepting it so the durable backend record,
+    # incident ledger, and later physical task results share the same id.
     post_snapshot, source = fetch_snapshot()
     with _ledger_lock:
-        _LEDGER.record_dispatch(target_id, plan["actions"], post_snapshot)
-        _LEDGER.record_work_order(work_order, post_snapshot)
         graded = _LEDGER.observe(post_snapshot)
+        incident_by_track = {incident["track_id"]: incident["id"]
+                             for incident in graded.get("incidents", []) if not incident.get("closed")}
+        work_order["incident_id"] = incident_by_track.get(work_order["target"])
 
-    # Closing a failed section is only the start of fixing it: hand the
-    # proposal's field work (crew, repair, signals) to the twin, which carries
-    # it out over ticks. Only the twin's own read-back ever marks it complete.
-    registered, problems = [], []
-    if apply_error is None:
-        registered, problems = _dispatch_field_work(plan, work_order, graded)
-        if registered:
-            final["log"].append({
-                "t": time.strftime("%H:%M:%S"),
-                "source": "Field",
-                "message": "Work order(s) registered on the twin: " + ", ".join(
-                    f"{o['id']} ({o['target']})" for o in registered),
-            })
-            with _ledger_lock:
-                for order in registered:
-                    _LEDGER.attach_work_order(order["id"], order.get("incident_id"))
-            post_snapshot, source = fetch_snapshot()
-            graded = _observe(post_snapshot)
-        elif plan.get("deferred_work"):
-            final["log"].append({
-                "t": time.strftime("%H:%M:%S"),
-                "source": "Field",
-                "message": (f"Plan {target_id} defers field work by doctrine: "
-                            + ", ".join(plan["deferred_work"])),
-            })
-        for problem in problems:
-            final["log"].append({
-                "t": time.strftime("%H:%M:%S"),
-                "source": "Field",
-                "message": f"Could not order field work — {problem}",
-            })
+    registered, problems = _dispatch_field_work(plan, work_order, graded)
+    if registered:
+        accepted = registered[0]
+        with _ledger_lock:
+            _LEDGER.record_work_order(work_order, post_snapshot)
+            _LEDGER.attach_work_order(accepted["id"], accepted.get("incident_id"))
+        final["log"].append({
+            "t": time.strftime("%H:%M:%S"), "source": "Backend",
+            "message": (f"Work order {accepted['id']} accepted for asynchronous execution "
+                        f"({len(accepted['tasks'])} task(s)); awaiting twin ticks."),
+        })
+        post_snapshot, source = fetch_snapshot()
+        graded = _observe(post_snapshot)
+    elif plan.get("deferred_work"):
+        final["log"].append({
+            "t": time.strftime("%H:%M:%S"), "source": "Field",
+            "message": f"Plan {target_id} defers field work: " + ", ".join(plan["deferred_work"]),
+        })
+    for problem in problems:
+        final["log"].append({
+            "t": time.strftime("%H:%M:%S"), "source": "Backend",
+            "message": f"Work order was not accepted — {problem}",
+        })
     final["work_order"] = {
         **work_order,
-        "status": ("DISPATCHED" if registered else
+        "status": ("ACCEPTED" if registered else
                    "DEFERRED" if plan.get("deferred_work") else "NO_FIELD_WORK"),
         "twin_orders": [o["id"] for o in registered],
     }
@@ -2066,11 +2066,10 @@ def apply_plan(plan_id: str | None = None):
     final["log"].append({
         "t": time.strftime("%H:%M:%S"),
         "source": "Escalation",
-        "message": (f"post-execution completion signal: {graded['resolution']}"
+        "message": (f"post-acceptance completion signal: {graded['resolution']}"
                     + (f" — {worst['id']} {worst['resolution_reason']}" if worst else "")),
     })
-    # Template-only explanation: the apply path must answer fast — actions are
-    # already applied to the twin, so a slow LLM call would make the console
-    # time out and mislabel a successful execution as offline.
-    return {"executed_plan": target_id, "applied_actions": applied,
+    # Template-only explanation: acceptance stays fast and never makes an
+    # LLM call while field work is waiting on the twin.
+    return {"executed_plan": target_id, "applied_actions": [],
             **_format_response(final, source, use_llm=False)}
