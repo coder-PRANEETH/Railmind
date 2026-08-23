@@ -145,10 +145,14 @@ export function Dashboard() {
   const [escalation, setEscalation] = useState<Escalation | null>(null);
   const [escalationOffline, setEscalationOffline] = useState(false);
   const [history, setHistory] = useState<RunRecord[]>([]);
+  const [activeNav, setActiveNav] = useState<"dashboard" | "twin" | "analytics">("dashboard");
   const [offlineTrains, setOfflineTrains] = useState<TrainType[]>(() =>
     TRAINS.map((t) => ({ ...t, current_station: t.route[0], route_index: 0, progress: 0 })),
   );
   const busyRef = useRef(false);
+  const dashboardRef = useRef<HTMLElement>(null);
+  const liveTwinRef = useRef<HTMLDivElement>(null);
+  const analyticsRef = useRef<HTMLDivElement>(null);
   // Latest-wins guard: an in-flight interval poll must not overwrite a
   // fresher post-run/post-apply snapshot with stale state.
   const liveSeqRef = useRef({ issued: 0, applied: 0 });
@@ -156,6 +160,17 @@ export function Dashboard() {
   // the console to the mock fleet — flip live→mock only after 2 consecutive
   // failures; flip back on the first success.
   const liveFailStreakRef = useRef(0);
+
+  const navigateTo = useCallback((section: "dashboard" | "twin" | "analytics") => {
+    setActiveNav(section);
+    const target =
+      section === "dashboard"
+        ? dashboardRef.current
+        : section === "twin"
+          ? liveTwinRef.current
+          : analyticsRef.current;
+    target?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const refreshLive = useCallback(async () => {
     const seq = ++liveSeqRef.current.issued;
@@ -305,8 +320,8 @@ export function Dashboard() {
   }, [refreshLive, refreshEscalation]);
 
   const onRetryWorkOrder = useCallback(
-    async (id: string) => {
-      const order = await retryWorkOrder(id);
+    async (id: string, taskId?: string) => {
+      const order = await retryWorkOrder(id, taskId);
       if (order) await afterFieldWork();
       return order;
     },
@@ -580,7 +595,7 @@ export function Dashboard() {
     <div className="min-h-screen text-foreground">
       {/* Header */}
       <header className="portfolio-header sticky top-0 z-30 border-b">
-        <div className="mx-auto max-w-[1600px] px-5 py-3 flex items-center gap-4">
+        <div className="w-full max-w-none px-[10px] py-3 flex items-center gap-4">
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-lg bg-success/15 glow-green">
               <Train className="h-5 w-5 text-success" />
@@ -611,9 +626,27 @@ export function Dashboard() {
           </div>
 
           <nav className="dashboard-nav hidden 2xl:flex" aria-label="Primary navigation">
-            <span className="dashboard-nav-active">Dashboard</span>
-            <span>Live Twin</span>
-            <span>Analytics</span>
+            <button
+              type="button"
+              className={activeNav === "dashboard" ? "dashboard-nav-active" : ""}
+              onClick={() => navigateTo("dashboard")}
+            >
+              Dashboard
+            </button>
+            <button
+              type="button"
+              className={activeNav === "twin" ? "dashboard-nav-active" : ""}
+              onClick={() => navigateTo("twin")}
+            >
+              Live Twin
+            </button>
+            <button
+              type="button"
+              className={activeNav === "analytics" ? "dashboard-nav-active" : ""}
+              onClick={() => navigateTo("analytics")}
+            >
+              Analytics
+            </button>
           </nav>
 
           <div className="ml-auto flex items-center gap-2">
@@ -681,7 +714,7 @@ export function Dashboard() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] px-5 py-3 grid grid-cols-12 gap-1">
+      <main ref={dashboardRef} className="w-full px-[10px] py-1 grid grid-cols-12 gap-1">
         {/* Escalation rail — handling level, owner, completion signal */}
         <EscalationRail escalation={escalation} offline={escalationOffline} />
 
@@ -763,7 +796,7 @@ export function Dashboard() {
         </Card>
 
         {/* Map */}
-        <Card className="col-span-12 lg:col-span-5 p-0 glass overflow-hidden">
+        <Card ref={liveTwinRef} className="col-span-12 lg:col-span-5 p-0 glass overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-border">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-info" />
@@ -801,70 +834,28 @@ export function Dashboard() {
           />
         </div>
 
-        {/* Agent decisions */}
-        <div className="col-span-12 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-1">
-          <AgentCard icon={<Cloud className="h-4 w-4" />} title="Weather Agent" color="text-info">
-            <Metric label="Strategy" value={data?.agent_outputs.weather.strategy ?? "—"} />
-            <Metric
-              label="Risk Score"
-              value={data ? data.agent_outputs.weather.risk_score.toFixed(2) : "—"}
-              accent="text-success"
-            />
-            <div>
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
-                High Risk
-              </div>
-              <div className="flex flex-wrap gap-1 mt-1">
-                {(data?.agent_outputs.weather.high_risk_tracks ?? []).map((t) => (
-                  <Badge key={t} variant="outline" className="font-mono-mc text-[10px]">
-                    {t}
-                  </Badge>
-                ))}
-                {!data && <span className="text-xs text-muted-foreground">Awaiting run…</span>}
-              </div>
-            </div>
-          </AgentCard>
+        {/* The map remains the first operational canvas; the completion signal follows it. */}
+        <IncidentTracker
+          escalation={escalation}
+          workOrders={live?.work_orders ?? []}
+          offline={escalationOffline}
+          onAcknowledge={onAcknowledge}
+          onBrief={onBrief}
+          busy={loading}
+        />
 
-          <AgentCard
-            icon={<ShieldAlert className="h-4 w-4" />}
-            title="Track Agent"
-            color="text-warning"
-          >
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
-              Actions
-            </div>
-            <ActionList items={data?.agent_outputs.track.actions} />
-          </AgentCard>
-
-          <AgentCard icon={<Radio className="h-4 w-4" />} title="Signal Agent" color="text-success">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
-              Actions
-            </div>
-            <ActionList items={data?.agent_outputs.signal.actions} />
-          </AgentCard>
-
-          <AgentCard icon={<Route className="h-4 w-4" />} title="Routing Agent" color="text-info">
-            <Metric
-              label="Affected Trains"
-              value={String(data?.agent_outputs.routing.affected_trains.length ?? 0)}
-            />
-            <div>
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
-                Reroutes
-              </div>
-              <div className="mt-1 space-y-1">
-                {(data?.agent_outputs.routing.reroutes ?? []).map((r) => (
-                  <div key={r.train} className="text-xs font-mono-mc flex items-center gap-2">
-                    <span className="text-foreground">{r.train}</span>
-                    <span className="text-muted-foreground">→</span>
-                    <span className="text-info">Rerouted</span>
-                  </div>
-                ))}
-                {!data && <span className="text-xs text-muted-foreground">Awaiting run…</span>}
-              </div>
-            </div>
-          </AgentCard>
-        </div>
+        <FieldWorkPanel
+          workOrders={live?.work_orders ?? []}
+          crews={live?.crews ?? {}}
+          simTick={live?.sim_tick ?? null}
+          offline={!live}
+          busy={loading}
+          dispatchTarget={trackId}
+          onRetry={onRetryWorkOrder}
+          onCancel={onCancelWorkOrder}
+          onAdvance={onAdvanceTwin}
+          onDispatch={onDispatchFieldWork}
+        />
 
         {/* Plans */}
         <Card className="col-span-12 xl:col-span-7 p-4 glass">
@@ -1046,28 +1037,70 @@ export function Dashboard() {
           )}
         </Card>
 
-        {/* Escalation tracker — per-incident completion signal and work */}
-        <IncidentTracker
-          escalation={escalation}
-          offline={escalationOffline}
-          onAcknowledge={onAcknowledge}
-          onBrief={onBrief}
-          busy={loading}
-        />
+        {/* Agent recommendations follow the operator's incident and work status. */}
+        <div className="col-span-12 grid grid-cols-1 gap-1 sm:grid-cols-2 xl:grid-cols-4">
+          <AgentCard icon={<Cloud className="h-4 w-4" />} title="Weather Agent" color="text-info">
+            <Metric label="Strategy" value={data?.agent_outputs.weather.strategy ?? "—"} />
+            <Metric
+              label="Risk Score"
+              value={data ? data.agent_outputs.weather.risk_score.toFixed(2) : "—"}
+              accent="text-success"
+            />
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+                High Risk
+              </div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {(data?.agent_outputs.weather.high_risk_tracks ?? []).map((t) => (
+                  <Badge key={t} variant="outline" className="font-mono-mc text-[10px]">
+                    {t}
+                  </Badge>
+                ))}
+                {!data && <span className="text-xs text-muted-foreground">Awaiting run…</span>}
+              </div>
+            </div>
+          </AgentCard>
 
-        {/* Field work — the twin's work orders and crews, proved tick by tick */}
-        <FieldWorkPanel
-          workOrders={live?.work_orders ?? []}
-          crews={live?.crews ?? {}}
-          simTick={live?.sim_tick ?? null}
-          offline={!live}
-          busy={loading}
-          dispatchTarget={trackId}
-          onRetry={onRetryWorkOrder}
-          onCancel={onCancelWorkOrder}
-          onAdvance={onAdvanceTwin}
-          onDispatch={onDispatchFieldWork}
-        />
+          <AgentCard
+            icon={<ShieldAlert className="h-4 w-4" />}
+            title="Track Agent"
+            color="text-warning"
+          >
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+              Actions
+            </div>
+            <ActionList items={data?.agent_outputs.track.actions} />
+          </AgentCard>
+
+          <AgentCard icon={<Radio className="h-4 w-4" />} title="Signal Agent" color="text-success">
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+              Actions
+            </div>
+            <ActionList items={data?.agent_outputs.signal.actions} />
+          </AgentCard>
+
+          <AgentCard icon={<Route className="h-4 w-4" />} title="Routing Agent" color="text-info">
+            <Metric
+              label="Affected Trains"
+              value={String(data?.agent_outputs.routing.affected_trains.length ?? 0)}
+            />
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+                Reroutes
+              </div>
+              <div className="mt-1 space-y-1">
+                {(data?.agent_outputs.routing.reroutes ?? []).map((r) => (
+                  <div key={r.train} className="flex items-center gap-2 text-xs font-mono-mc">
+                    <span className="text-foreground">{r.train}</span>
+                    <span className="text-muted-foreground">→</span>
+                    <span className="text-info">Rerouted</span>
+                  </div>
+                ))}
+                {!data && <span className="text-xs text-muted-foreground">Awaiting run…</span>}
+              </div>
+            </div>
+          </AgentCard>
+        </div>
 
         {/* Timeline */}
         <Card className="col-span-12 xl:col-span-7 p-0 glass overflow-hidden">
@@ -1108,7 +1141,7 @@ export function Dashboard() {
         </Card>
 
         {/* Analytics */}
-        <Card className="col-span-12 xl:col-span-5 p-4 glass">
+        <Card ref={analyticsRef} className="col-span-12 xl:col-span-5 p-4 glass">
           <div className="flex items-center gap-2 mb-3">
             <BarChart3 className="h-4 w-4 text-info" />
             <div className="text-sm font-semibold">Run Analytics</div>

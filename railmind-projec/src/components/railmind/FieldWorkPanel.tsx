@@ -45,12 +45,12 @@ function corridor(target: string): string {
   return track ? `${stationName(track.from)} ↔ ${stationName(track.to)}` : target;
 }
 
-function TaskRow({ task }: { task: FieldTask }) {
+function TaskRow({ task, retry, busy }: { task: FieldTask; retry?: () => void; busy: boolean }) {
   const tone = TASK_TONE[task.status] ?? TASK_TONE.PENDING;
   const Icon = tone.icon;
-  const running = task.status === "IN_PROGRESS";
+  const progress = Math.round(task.progress * 100);
   return (
-    <li className="py-1">
+    <li className={`py-2 ${task.status === "BLOCKED" ? "rounded bg-danger/5 px-2" : ""}`}>
       <div className="flex items-center gap-2 text-[11px]">
         <Icon className={`h-3.5 w-3.5 shrink-0 ${tone.cls} ${tone.spin ? "animate-spin" : ""}`} />
         <span className="font-mono-mc text-[10px] text-muted-foreground w-[52px] shrink-0">
@@ -60,31 +60,58 @@ function TaskRow({ task }: { task: FieldTask }) {
         <span className="font-mono-mc text-[10px] text-muted-foreground">{task.target}</span>
         <span className={`ml-auto font-mono-mc text-[10px] ${tone.cls}`}>
           {task.status === "COMPLETED"
-            ? "DONE"
+            ? "COMPLETED"
             : task.status === "PENDING"
               ? "WAITING"
               : `${task.status}${task.ticks_remaining > 0 ? ` · ${task.ticks_remaining}t` : ""}`}
         </span>
       </div>
-      {(running || task.status === "BLOCKED") && (
+      <div className="ml-[22px] mt-1 flex items-center gap-2">
         <div
-          className="mt-1 ml-[22px] h-1 w-[calc(100%-22px)] rounded-full bg-muted overflow-hidden"
+          className="h-1 flex-1 rounded-full bg-muted overflow-hidden"
           role="progressbar"
-          aria-valuenow={Math.round(task.progress * 100)}
+          aria-valuenow={progress}
           aria-valuemin={0}
           aria-valuemax={100}
           aria-label={`${ACTION_LABEL[task.action] ?? task.action} progress`}
         >
           <span
             className={`block h-full rounded-full transition-all duration-700 ${
-              task.status === "BLOCKED" ? "bg-danger" : "bg-info"
+              task.status === "COMPLETED"
+                ? "bg-success"
+                : task.status === "BLOCKED" || task.status === "UNRESOLVED"
+                  ? "bg-danger"
+                  : task.status === "CANCELLED"
+                    ? "bg-muted-foreground"
+                    : "bg-info"
             }`}
-            style={{ width: `${Math.max(2, task.progress * 100)}%` }}
+            style={{ width: `${progress === 0 ? 0 : Math.max(2, progress)}%` }}
           />
+        </div>
+        <span className="w-[74px] text-right font-mono-mc text-[10px] text-muted-foreground">
+          {progress}%{task.ticks_remaining > 0 ? ` · ${task.ticks_remaining}t` : ""}
+        </span>
+      </div>
+      {task.depends_on.length > 0 && (
+        <div className="ml-[22px] mt-1 font-mono-mc text-[10px] text-muted-foreground">
+          Depends on: {task.depends_on.join(", ")}
         </div>
       )}
       {task.blocking_reason ? (
-        <div className="ml-[22px] mt-0.5 text-[11px] text-danger">{task.blocking_reason}</div>
+        <div className="ml-[22px] mt-1 flex flex-wrap items-center gap-2 text-[11px] text-danger">
+          <span>Reason: {task.blocking_reason}</span>
+          {retry && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 border-danger/40 px-2 text-[10px] text-danger hover:bg-danger/10"
+              onClick={retry}
+              disabled={busy}
+            >
+              Retry task
+            </Button>
+          )}
+        </div>
       ) : (
         task.detail &&
         task.status !== "COMPLETED" && (
@@ -107,12 +134,25 @@ function OrderCard({
   crews: CrewUnit[];
   busy: boolean;
   pending: string | null;
-  onRetry: (id: string) => Promise<unknown>;
+  onRetry: (id: string, taskId?: string) => Promise<unknown>;
   onCancel: (id: string) => Promise<unknown>;
 }) {
   const live = LIVE.has(order.status);
   const blocked = order.tasks.some((t) => t.status === "BLOCKED");
   const acting = pending === order.id;
+  const completedTasks = order.tasks.filter((t) => t.status === "COMPLETED").length;
+  const latestEvent = order.events.at(-1);
+  const createdAt =
+    typeof order.created_at === "number" && order.created_at > 0
+      ? new Date(order.created_at * 1000).toLocaleString()
+      : `Twin tick ${order.created_tick}`;
+  const copyId = async () => {
+    try {
+      await navigator.clipboard.writeText(order.id);
+    } catch {
+      // Clipboard access can be unavailable on an insecure demo origin.
+    }
+  };
   const chip =
     order.status === "CANCELLED" ? (
       <span
@@ -128,10 +168,25 @@ function OrderCard({
 
   return (
     <div
-      className={`rounded-lg glass p-3.5 ${order.status === "BLOCKED" ? "border-danger/40" : ""}`}
+      className={`rounded-lg glass p-3.5 ${
+        order.status === "BLOCKED"
+          ? "border-danger/50 bg-danger/5"
+          : order.status === "PARTIAL"
+            ? "border-warning/40 bg-warning/5"
+            : order.status === "COMPLETE"
+              ? "border-success/40"
+              : ""
+      }`}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono-mc text-[12px] text-info">{order.id}</span>
+        <button
+          type="button"
+          className="font-mono-mc text-[12px] text-info underline-offset-2 hover:underline"
+          onClick={() => void copyId()}
+          title="Copy Work Order ID"
+        >
+          {order.id}
+        </button>
         <span className="text-sm font-semibold">
           {order.target} · {corridor(order.target)}
         </span>
@@ -139,6 +194,41 @@ function OrderCard({
         <span className="ml-auto font-mono-mc text-[10px] text-muted-foreground">
           {order.incident_id ?? "no incident"} · {order.type.replace(/_/g, " ").toLowerCase()}
         </span>
+      </div>
+
+      <div className="mt-2 grid gap-2 rounded-md border border-border/70 bg-background/20 p-2 text-[10px] font-mono-mc sm:grid-cols-3 xl:grid-cols-6">
+        <div>
+          <span className="text-muted-foreground">TYPE</span>
+          <div className="mt-0.5 text-foreground">{order.type}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">TARGET</span>
+          <div className="mt-0.5 text-foreground">{order.target}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">STATUS</span>
+          <div
+            className={`mt-0.5 ${order.status === "BLOCKED" ? "text-danger" : "text-foreground"}`}
+          >
+            {order.status}
+          </div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">CREATED</span>
+          <div className="mt-0.5 text-foreground">{createdAt}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">LAST UPDATED</span>
+          <div className="mt-0.5 text-foreground">
+            {latestEvent ? `t${latestEvent.tick} · ${latestEvent.kind}` : "No activity yet"}
+          </div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">TASKS</span>
+          <div className="mt-0.5 text-foreground">
+            {completedTasks} / {order.tasks.length} complete
+          </div>
+        </div>
       </div>
 
       <div className="mt-2 flex items-baseline justify-between text-[10px] font-mono-mc text-muted-foreground">
@@ -171,9 +261,31 @@ function OrderCard({
         />
       </div>
 
+      {order.status === "UNRESOLVED" && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          No committed work has been verified yet. Tasks are waiting for the twin to progress.
+        </div>
+      )}
+      {order.status === "COMPLETE" && (
+        <div className="mt-2 flex items-center gap-1.5 text-[11px] text-success">
+          <CheckCircle2 className="h-3.5 w-3.5" /> Response successfully verified against the
+          Digital Twin.
+        </div>
+      )}
+      {order.status === "BLOCKED" && (
+        <div className="mt-2 text-[11px] text-danger">
+          BLOCKED — the reason is shown on each blocked task below.
+        </div>
+      )}
+
       <ul className="mt-2 divide-y divide-border/60">
         {order.tasks.map((t) => (
-          <TaskRow key={t.id} task={t} />
+          <TaskRow
+            key={t.id}
+            task={t}
+            busy={busy || acting}
+            retry={t.status === "BLOCKED" ? () => void onRetry(order.id, t.id) : undefined}
+          />
         ))}
       </ul>
 
@@ -263,7 +375,7 @@ export function FieldWorkPanel({
   offline: boolean;
   busy?: boolean;
   dispatchTarget: string;
-  onRetry: (id: string) => Promise<WorkOrder | null>;
+  onRetry: (id: string, taskId?: string) => Promise<WorkOrder | null>;
   onCancel: (id: string) => Promise<WorkOrder | null>;
   onAdvance: (ticks: number) => Promise<boolean>;
   onDispatch: (trackId: string) => Promise<WorkOrder | null>;
@@ -370,11 +482,11 @@ export function FieldWorkPanel({
                   crews={crewList.filter((c) => c.work_order_id === order.id)}
                   busy={busy}
                   pending={pending}
-                  onRetry={(id) =>
+                  onRetry={(id, taskId) =>
                     act(
                       id,
-                      () => onRetry(id),
-                      `${id}: blocked work queued for retry.`,
+                      () => onRetry(id, taskId),
+                      `${taskId ?? id}: blocked work queued for retry.`,
                       `${id}: nothing could be retried.`,
                     )
                   }

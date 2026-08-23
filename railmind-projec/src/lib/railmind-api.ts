@@ -141,6 +141,8 @@ export type WorkOrder = {
   completion_percentage: number;
   estimated_ticks_remaining: number;
   created_tick: number;
+  /** Epoch seconds from the twin; absent only on an older relay. */
+  created_at?: number;
   cancelled: boolean;
   cancel_reason: string | null;
   auto_retry: boolean;

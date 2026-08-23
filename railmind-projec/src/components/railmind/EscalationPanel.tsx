@@ -22,6 +22,7 @@ import type {
   HandoffBrief,
   Incident,
   Resolution,
+  WorkOrder,
   WorkItem,
   WorkState,
 } from "@/lib/railmind-api";
@@ -161,6 +162,8 @@ export function EscalationRail({
   }, [level]);
 
   const totals = escalation?.totals;
+  const response = escalation?.resolution ?? "COMPLETE";
+  const responseTone = RESOLUTION_TONE[response];
   return (
     <div
       className={`col-span-12 flex flex-wrap items-center gap-x-6 gap-y-3 rounded-xl glass px-4 py-3 ${
@@ -196,12 +199,12 @@ export function EscalationRail({
         <div className="font-mono-mc text-sm">{escalation?.owner ?? "Section Controller"}</div>
       </div>
 
-      <div>
+      <div className={`rounded-md border px-3 py-1.5 ${responseTone.border} ${responseTone.bg}`}>
         <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
-          Response
+          Completion signal
         </div>
         <div className="mt-0.5">
-          <ResolutionChip resolution={escalation?.resolution ?? "COMPLETE"} />
+          <ResolutionChip resolution={response} />
         </div>
       </div>
 
@@ -268,13 +271,171 @@ function WorkRow({ item }: { item: WorkItem }) {
   );
 }
 
+function FieldWorkSummary({ incident, order }: { incident: Incident; order?: WorkOrder }) {
+  const fieldWork = incident.field_work;
+  if (!fieldWork) return null;
+
+  const tasks = fieldWork.tasks;
+  const completed = tasks.filter((task) => task.status === "COMPLETED");
+  const remaining = tasks.filter((task) => task.status !== "COMPLETED");
+  const latestEvent = order?.events.at(-1);
+  const created =
+    typeof order?.created_at === "number" && order.created_at > 0
+      ? new Date(order.created_at * 1000).toLocaleString()
+      : order
+        ? `Twin tick ${order.created_tick}`
+        : "Reported by ledger";
+  const copyId = async () => {
+    try {
+      await navigator.clipboard.writeText(fieldWork.id);
+    } catch {
+      // Clipboard access may be unavailable when the console is served over HTTP.
+    }
+  };
+
+  return (
+    <section
+      className="mt-3 rounded-md border border-border bg-background/20 p-3"
+      aria-label="Work order"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
+          Work order
+        </div>
+        <button
+          type="button"
+          onClick={() => void copyId()}
+          title="Copy Work Order ID"
+          className="font-mono-mc text-[11px] text-info underline-offset-2 hover:underline"
+        >
+          {fieldWork.id}
+        </button>
+        {fieldWork.status === "CANCELLED" ? (
+          <span className="font-mono-mc text-[10px] text-muted-foreground">CANCELLED</span>
+        ) : (
+          <ResolutionChip resolution={fieldWork.status} size="xs" />
+        )}
+      </div>
+
+      <div className="mt-2 grid gap-2 font-mono-mc text-[10px] sm:grid-cols-2 xl:grid-cols-4">
+        <div>
+          <span className="text-muted-foreground">TYPE</span>
+          <div className="mt-0.5">{order?.type ?? "FIELD RESPONSE"}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">TARGET</span>
+          <div className="mt-0.5">{order?.target ?? incident.track_id}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">PROGRESS</span>
+          <div className="mt-0.5">
+            {fieldWork.completion_percentage}% · {completed.length}/{tasks.length} complete
+          </div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">ETTR</span>
+          <div className="mt-0.5">
+            {fieldWork.estimated_ticks_remaining > 0
+              ? `${fieldWork.estimated_ticks_remaining} ticks`
+              : "—"}
+          </div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">CREATED</span>
+          <div className="mt-0.5">{created}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">LAST UPDATED</span>
+          <div className="mt-0.5">
+            {latestEvent ? `t${latestEvent.tick} · ${latestEvent.kind}` : "No activity yet"}
+          </div>
+        </div>
+      </div>
+
+      <div
+        className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-valuenow={fieldWork.completion_percentage}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label="Work order completion"
+      >
+        <span
+          className={`block h-full rounded-full ${fieldWork.status === "COMPLETE" ? "bg-success" : fieldWork.status === "BLOCKED" ? "bg-danger" : "bg-info"}`}
+          style={{ width: `${fieldWork.completion_percentage}%` }}
+        />
+      </div>
+
+      {fieldWork.status === "COMPLETE" && (
+        <div className="mt-2 flex items-center gap-1.5 text-[11px] text-success">
+          <ShieldCheck className="h-3.5 w-3.5" /> Response successfully verified against the Digital
+          Twin.
+        </div>
+      )}
+      {fieldWork.status === "UNRESOLVED" && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          No committed work has been verified yet. Pending tasks are listed below.
+        </div>
+      )}
+      {fieldWork.status === "BLOCKED" && (
+        <div className="mt-2 text-[11px] text-danger">
+          BLOCKED — {fieldWork.blocked_reason ?? "A field task requires operator intervention."}
+        </div>
+      )}
+      {fieldWork.status === "PARTIAL" && (
+        <div className="mt-2 text-[11px] text-warning">
+          PARTIAL — {completed.length} / {tasks.length} tasks completed; {remaining.length}{" "}
+          remaining.
+        </div>
+      )}
+
+      <ul className="mt-2 space-y-1.5">
+        {tasks.map((task) => {
+          const done = task.status === "COMPLETED";
+          const blocked = task.status === "BLOCKED";
+          return (
+            <li key={task.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+              {done ? (
+                <CheckCircle2 className="h-3.5 w-3.5 text-success" />
+              ) : blocked ? (
+                <Ban className="h-3.5 w-3.5 text-danger" />
+              ) : (
+                <CircleDashed className="h-3.5 w-3.5 text-muted-foreground" />
+              )}
+              <span className="font-mono-mc">{task.action}</span>
+              <span className="font-mono-mc text-muted-foreground">{task.target}</span>
+              <span
+                className={
+                  done ? "text-success" : blocked ? "text-danger" : "text-muted-foreground"
+                }
+              >
+                {task.status}
+              </span>
+              {task.ticks_remaining > 0 && (
+                <span className="font-mono-mc text-[10px] text-muted-foreground">
+                  · {task.ticks_remaining}t left
+                </span>
+              )}
+              {task.blocking_reason && (
+                <span className="basis-full pl-5 text-danger">Reason: {task.blocking_reason}</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 function IncidentCard({
   incident,
+  order,
   onAcknowledge,
   onBrief,
   busy,
 }: {
   incident: Incident;
+  order?: WorkOrder;
   onAcknowledge: (id: string) => Promise<void>;
   onBrief: (id: string) => Promise<HandoffBrief | null>;
   busy: boolean;
@@ -304,9 +465,19 @@ function IncidentCard({
   }, [incident.id, onAcknowledge]);
 
   return (
-    <div className="rounded-lg glass p-3.5">
+    <div
+      className={`rounded-lg border-l-4 glass p-3.5 ${
+        incident.level >= 3
+          ? "border-l-danger bg-danger/5"
+          : incident.level === 2
+            ? "border-l-warning bg-warning/5"
+            : "border-l-info"
+      }`}
+    >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <span className={`font-mono-mc text-sm font-semibold ${tone.text}`}>{incident.code}</span>
+        <span className={`font-mono-mc text-sm font-semibold ${tone.text}`}>
+          {incident.code} · {incident.tier_label.toUpperCase()}
+        </span>
         <span className="font-mono-mc text-[12px]">{incident.corridor}</span>
         <ResolutionChip resolution={incident.resolution} size="xs" />
         <span className="ml-auto font-mono-mc text-[10px] text-muted-foreground">
@@ -358,38 +529,6 @@ function IncidentCard({
               ))}
             </ul>
           )}
-          {incident.field_work && (
-            <div className="mt-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono-mc">
-                Field work
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
-                <span className="font-mono-mc text-[10px] text-info">{incident.field_work.id}</span>
-                {incident.field_work.status === "CANCELLED" ? (
-                  <span className="font-mono-mc text-[10px] text-muted-foreground">CANCELLED</span>
-                ) : (
-                  <ResolutionChip resolution={incident.field_work.status} size="xs" />
-                )}
-                <span className="font-mono-mc text-[10px] text-muted-foreground">
-                  {incident.field_work.completion_percentage}%
-                  {incident.field_work.estimated_ticks_remaining > 0
-                    ? ` · ≈ ${incident.field_work.estimated_ticks_remaining} ticks left`
-                    : ""}
-                </span>
-              </div>
-              {incident.field_work.blocked_reason ? (
-                <div className="mt-0.5 text-[11px] text-danger">
-                  {incident.field_work.blocked_reason}
-                </div>
-              ) : (
-                incident.field_work.current && (
-                  <div className="mt-0.5 text-[11px] text-muted-foreground">
-                    {incident.field_work.current}
-                  </div>
-                )
-              )}
-            </div>
-          )}
         </div>
 
         <div>
@@ -408,6 +547,8 @@ function IncidentCard({
           </ul>
         </div>
       </div>
+
+      <FieldWorkSummary incident={incident} order={order} />
 
       {incident.events.length > 0 && (
         <div className="mt-3.5">
@@ -477,12 +618,14 @@ function IncidentCard({
 
 export function IncidentTracker({
   escalation,
+  workOrders = [],
   offline,
   onAcknowledge,
   onBrief,
   busy = false,
 }: {
   escalation: Escalation | null;
+  workOrders?: WorkOrder[];
   offline: boolean;
   onAcknowledge: (id: string) => Promise<void>;
   onBrief: (id: string) => Promise<HandoffBrief | null>;
@@ -520,6 +663,7 @@ export function IncidentTracker({
               <IncidentCard
                 key={incident.id}
                 incident={incident}
+                order={workOrders.find((order) => order.id === incident.field_work?.id)}
                 onAcknowledge={onAcknowledge}
                 onBrief={onBrief}
                 busy={busy}
